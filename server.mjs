@@ -8,6 +8,7 @@ import pg from 'pg';
 import { createClient } from 'redis';
 import fixedFleetBonus from './ff-bonus.js';
 import spotBonus from './spot-bonus.js';
+import {getInvoiceObject, getInvoiceStorage, invoiceObjectKey, putInvoiceObject} from './invoice-storage.mjs';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
 const port = Number(process.env.PORT || 4173);
@@ -260,6 +261,7 @@ async function initDatabase() {
     CREATE TABLE IF NOT EXISTS base_team_configs (base TEXT PRIMARY KEY, coordinator TEXT NOT NULL DEFAULT '', dispatchers JSONB NOT NULL DEFAULT '[]'::jsonb, ff_recipient TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS invoices (id BIGSERIAL PRIMARY KEY, period TEXT NOT NULL, mode TEXT NOT NULL, base TEXT NOT NULL, dispatcher TEXT NOT NULL, file_name TEXT NOT NULL, mime_type TEXT, file_size BIGINT NOT NULL DEFAULT 0, amount NUMERIC(12,2) NOT NULL DEFAULT 0, file_data BYTEA, public_token TEXT, deleted_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(period, mode, base, dispatcher));
     ALTER TABLE invoices ADD COLUMN IF NOT EXISTS public_token TEXT;
+    ALTER TABLE invoices ADD COLUMN IF NOT EXISTS storage_key TEXT;
     ALTER TABLE invoices ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     CREATE UNIQUE INDEX IF NOT EXISTS invoices_public_token_idx ON invoices(public_token) WHERE public_token IS NOT NULL;
     CREATE INDEX IF NOT EXISTS invoices_period_idx ON invoices(period, mode, base);
@@ -469,16 +471,29 @@ async function saveInvoice(payload, req) {
   if (payload.mimeType && !['application/octet-stream', mimeType].includes(String(payload.mimeType).toLowerCase())) throw new HttpError(400, 'invoice-mime-invalid');
   const fileData = decodeBase64(payload.fileBase64, maxInvoiceFile), claimedCents = bonusCents(payload.amount, mode), calculatedCents = await authoritativeBonusCents(period, mode, base, dispatcher), amountCents = assertInvoiceBonusEligible(calculatedCents);
   if ((isProduction || process.env.STRICT_SERVER_BONUS === 'true') && claimedCents !== amountCents) throw new HttpError(409, 'bonus-amount-mismatch');
+  let storageKey = null;
+  let storedFileData = fileData;
+  try {
+    const storage = getInvoiceStorage();
+    if (storage) {
+      storageKey = invoiceObjectKey(period, randomUUID(), fileName);
+      await putInvoiceObject(storage, {key: storageKey, body: fileData, contentType: mimeType});
+      storedFileData = null;
+    }
+  } catch (error) {
+    console.error(JSON.stringify({event: 'invoice-object-upload-failed', requestId: req.requestId, message: error?.message || 'unknown-error'}));
+    throw new HttpError(503, 'invoice-storage-unavailable');
+  }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const result = await client.query(`INSERT INTO invoices (period,mode,base,dispatcher,file_name,mime_type,file_size,amount,file_data,public_token,deleted_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL) ON CONFLICT (period,mode,base,dispatcher) DO UPDATE SET file_name=EXCLUDED.file_name,mime_type=EXCLUDED.mime_type,file_size=EXCLUDED.file_size,amount=EXCLUDED.amount,file_data=EXCLUDED.file_data,deleted_at=NULL,created_at=NOW() RETURNING public_token AS file_token,period,mode,base,dispatcher,file_name,mime_type,file_size,amount,created_at`, [period, mode, base, dispatcher, fileName, mimeType, fileData.length, amountCents / 100, fileData, randomUUID()]);
+    const result = await client.query(`INSERT INTO invoices (period,mode,base,dispatcher,file_name,mime_type,file_size,amount,file_data,storage_key,public_token,deleted_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL) ON CONFLICT (period,mode,base,dispatcher) DO UPDATE SET file_name=EXCLUDED.file_name,mime_type=EXCLUDED.mime_type,file_size=EXCLUDED.file_size,amount=EXCLUDED.amount,file_data=EXCLUDED.file_data,storage_key=EXCLUDED.storage_key,deleted_at=NULL,created_at=NOW() RETURNING public_token AS file_token,period,mode,base,dispatcher,file_name,mime_type,file_size,amount,created_at`, [period, mode, base, dispatcher, fileName, mimeType, fileData.length, amountCents / 100, storedFileData, storageKey, randomUUID()]);
     await audit(client, 'invoice-upsert', 'invoice', `${period}:${mode}:${base}:${dispatcher}`, req, {amountCents, fileSize: fileData.length, serverCalculated: true});
     await client.query('COMMIT');
     return result.rows[0];
   } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
 }
-async function downloadInvoice(token, res) { if (!pool) throw new HttpError(503, 'database-not-configured'); if (!/^[a-f0-9-]{36}$/i.test(token)) throw new HttpError(400, 'file-token-invalid'); const result = await pool.query('SELECT file_name, mime_type, file_data FROM invoices WHERE public_token=$1 AND deleted_at IS NULL', [token]); if (!result.rowCount) throw new HttpError(404, 'not-found'); const row = result.rows[0]; if (!row.file_data || !Buffer.from(row.file_data).length) throw new HttpError(500, 'invoice-file-unavailable'); const data = Buffer.from(row.file_data); res.setHeader('content-type', row.mime_type || 'application/octet-stream'); res.setHeader('content-disposition', invoiceContentDisposition(row.file_name)); res.setHeader('content-length', data.length); res.setHeader('cache-control', 'private, no-store'); res.setHeader('x-content-type-options', 'nosniff'); res.end(data); }
+async function downloadInvoice(token, req, res) { if (!pool) throw new HttpError(503, 'database-not-configured'); if (!/^[a-f0-9-]{36}$/i.test(token)) throw new HttpError(400, 'file-token-invalid'); const result = await pool.query('SELECT file_name, mime_type, file_data, storage_key FROM invoices WHERE public_token=$1 AND deleted_at IS NULL', [token]); if (!result.rowCount) throw new HttpError(404, 'not-found'); const row = result.rows[0]; let data; try { if (row.storage_key) { const storage = getInvoiceStorage(); if (!storage) throw new Error('invoice-storage-not-configured'); data = await getInvoiceObject(storage, row.storage_key); } else if (row.file_data) data = Buffer.from(row.file_data); } catch (error) { console.error(JSON.stringify({event: 'invoice-object-download-failed', requestId: req.requestId, message: error?.message || 'unknown-error'})); throw new HttpError(503, 'invoice-storage-unavailable'); } if (!data?.length) throw new HttpError(500, 'invoice-file-unavailable'); res.setHeader('content-type', row.mime_type || 'application/octet-stream'); res.setHeader('content-disposition', invoiceContentDisposition(row.file_name)); res.setHeader('content-length', data.length); res.setHeader('cache-control', 'private, no-store'); res.setHeader('x-content-type-options', 'nosniff'); res.end(data); }
 async function archiveInvoice(token, req) { if (!pool) throw new HttpError(503, 'database-not-configured'); if (!/^[a-f0-9-]{36}$/i.test(token)) throw new HttpError(400, 'file-token-invalid'); const client = await pool.connect(); try { await client.query('BEGIN'); const result = await client.query('UPDATE invoices SET deleted_at=NOW() WHERE public_token=$1 AND deleted_at IS NULL RETURNING public_token', [token]); if (!result.rowCount) throw new HttpError(404, 'not-found'); await audit(client, 'invoice-archive', 'invoice', token, req); await client.query('COMMIT'); return {archived: true}; } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); } }
 
 async function routeRequest(req, res) {
@@ -502,7 +517,7 @@ async function routeRequest(req, res) {
   if (pathname === '/api/teams' && req.method === 'POST') { await checkMutation(req, res, ['manager', 'coordinator']); const result = await saveTeamConfig(await readJson(req, 2 * 1024 * 1024), req); await invalidateCache('bonus:cache:teams:v1'); return sendJson(res, 201, result, requestId); }
   if (pathname === '/api/invoices' && req.method === 'GET') { await checkPrivateRead(req, ['manager', 'coordinator']); return sendJson(res, 200, await cachedJson('bonus:cache:invoices:v1', 60, listInvoices), requestId); }
   if (pathname === '/api/invoices' && req.method === 'POST') { await checkMutation(req, res, ['manager', 'coordinator']); const result = await saveInvoice(await readJson(req, 15 * 1024 * 1024), req); await invalidateCache('bonus:cache:invoices:v1'); return sendJson(res, 201, result, requestId); }
-  const invoiceMatch = pathname.match(/^\/api\/invoices\/([a-f0-9-]{36})\/file$/i); if (invoiceMatch && req.method === 'GET') { await checkPrivateRead(req, ['manager', 'coordinator']); return downloadInvoice(invoiceMatch[1], res); }
+  const invoiceMatch = pathname.match(/^\/api\/invoices\/([a-f0-9-]{36})\/file$/i); if (invoiceMatch && req.method === 'GET') { await checkPrivateRead(req, ['manager', 'coordinator']); return downloadInvoice(invoiceMatch[1], req, res); }
   const invoiceArchiveMatch = pathname.match(/^\/api\/invoices\/([a-f0-9-]{36})$/i); if (invoiceArchiveMatch && req.method === 'DELETE') { await checkMutation(req, res); const result = await archiveInvoice(invoiceArchiveMatch[1], req); await invalidateCache('bonus:cache:invoices:v1'); return sendJson(res, 200, result, requestId); }
   const file = publicPath(pathname); if (!file) throw new HttpError(404, 'not-found');
   if ((pathname === '/' || pathname === '/index.html') && !(await currentSession(req))) { res.statusCode = 302; res.setHeader('Location', '/login.html'); return res.end(); }

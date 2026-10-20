@@ -92,3 +92,19 @@ ou arquivos `.env`; em Railway, use as variáveis protegidas do serviço e um us
 banco com permissões somente nas tabelas da aplicação. A aplicação cria a tabela de
 sessões na migração inicial para manter compatibilidade com o ambiente atual; depois de
 aplicar e validar a migração, retire permissões DDL do usuário da aplicação.
+
+## Armazenamento de notas fiscais
+
+Em produção, as notas são salvas no bucket S3 privado `bonus-control-notas-fiscais`, com
+chaves no formato `AAAA-MM/<id>/<nome-original>`. O banco mantém metadados, token de acesso
+e a chave do objeto; downloads continuam passando pela API autenticada. Sem variáveis S3
+configuradas (desenvolvimento local), o armazenamento legado no PostgreSQL permanece
+disponível. Uma configuração S3 parcial faz o upload falhar explicitamente, sem gravar o
+arquivo em um destino diferente.
+
+Após fornecer as variáveis S3 no serviço, aplique a alteração de esquema como proprietário
+do banco (`ALTER TABLE public.invoices ADD COLUMN IF NOT EXISTS storage_key TEXT;`) e então
+execute `npm run migrate:invoices` uma vez no ambiente conectado. A rotina copia os arquivos
+existentes em lotes e verifica tamanho e SHA-256 no bucket antes de atualizar cada linha. Ela
+é idempotente e preserva `file_data` no PostgreSQL como cópia de segurança; não apaga anexos
+existentes. O usuário da aplicação não é proprietário da tabela e não pode aplicar esse DDL.
