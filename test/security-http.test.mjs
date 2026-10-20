@@ -37,6 +37,18 @@ test('production server blocks admin mutation and internal files', async () => {
     assert.ok((await renewedSession.json()).expiresAt);
     const dashboard = await fetch(`${base}/`, {headers: {cookie}});
     assert.equal(dashboard.status, 200);
+    const scopedRoutes = await fetch(`${base}/outputs/thread-01/ff_routes.json?period=2026-07`, {headers: {cookie}});
+    assert.equal(scopedRoutes.status, 200);
+    const routeRows = await scopedRoutes.json();
+    assert.ok(routeRows.length > 0);
+    assert.ok(routeRows.every(row => new Date(Date.UTC(1899, 11, 30) + Number(row.data_serial) * 86400000).toISOString().slice(0, 7) === '2026-07'));
+    const scopedFirstHalf = await fetch(`${base}/outputs/thread-01/ff_routes.json?period=2026-07%3A1`, {headers: {cookie}});
+    assert.equal(scopedFirstHalf.status, 200);
+    const firstHalfRows = await scopedFirstHalf.json();
+    assert.ok(firstHalfRows.length > 0 && firstHalfRows.length < routeRows.length);
+    assert.ok(firstHalfRows.every(row => new Date(Date.UTC(1899, 11, 30) + Number(row.data_serial) * 86400000).getUTCDate() <= 15));
+    const scopedImports = await fetch(`${base}/api/imports/latest?period=2026-07`, {headers: {cookie}});
+    assert.equal(scopedImports.status, 200);
     const mutation = await fetch(`${base}/api/imports`, {method: 'POST', headers: {'content-type': 'application/json', origin: base, cookie}, body: JSON.stringify({sourceType: 'DDS'})});
     assert.equal(mutation.status, 403);
     assert.equal((await mutation.json()).error, 'administrative-operation-restricted');
@@ -79,8 +91,11 @@ test('server enforces manager, coordination and dispatcher roles independently',
     assert.equal(manager.body.role, 'manager');
     assert.equal(coordinator.body.role, 'coordinator');
     assert.equal(coordinator.body.permissions.canUploadInvoice, true);
+    assert.equal(coordinator.body.permissions.canManageTeams, true);
+    assert.ok(coordinator.body.permissions.views.includes('dispatchers'));
     assert.equal(dispatcher.body.role, 'dispatcher');
     assert.equal(dispatcher.body.permissions.canUploadInvoice, false);
+    assert.equal(dispatcher.body.permissions.views.includes('dispatchers'), false);
     assert.notEqual(dispatcher.cookie, secondDispatcherSession.cookie);
 
     const dispatcherTeams = await fetch(`${roleBase}/api/teams`, {headers: {cookie: dispatcher.cookie}});
@@ -92,6 +107,10 @@ test('server enforces manager, coordination and dispatcher roles independently',
     assert.equal((await dispatcherImport.json()).error, 'access-denied');
     const coordinatorImport = await fetch(`${roleBase}/api/imports`, {method: 'POST', headers: {'content-type': 'application/json', origin: roleBase, cookie: coordinator.cookie}, body: JSON.stringify({sourceType: 'DDS'})});
     assert.equal(coordinatorImport.status, 403);
+    const coordinatorTeamEdit = await fetch(`${roleBase}/api/teams`, {method: 'POST', headers: {'content-type': 'application/json', origin: roleBase, cookie: coordinator.cookie}, body: JSON.stringify({base: 'BASE TESTE', coordinator: '', dispatchers: [], dispatcherModes: {}, ffRecipient: ''})});
+    assert.equal(coordinatorTeamEdit.status, 503);
+    const dispatcherTeamEdit = await fetch(`${roleBase}/api/teams`, {method: 'POST', headers: {'content-type': 'application/json', origin: roleBase, cookie: dispatcher.cookie}, body: JSON.stringify({base: 'BASE TESTE', coordinator: '', dispatchers: [], dispatcherModes: {}, ffRecipient: ''})});
+    assert.equal(dispatcherTeamEdit.status, 403);
     const coordinatorInvoices = await fetch(`${roleBase}/api/invoices`, {headers: {cookie: coordinator.cookie}});
     assert.equal(coordinatorInvoices.status, 200);
     const dispatcherInvoices = await fetch(`${roleBase}/api/invoices`, {headers: {cookie: dispatcher.cookie}});

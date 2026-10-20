@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import pg from 'pg';
 import { createClient } from 'redis';
 import fixedFleetBonus from './ff-bonus.js';
@@ -20,8 +21,9 @@ const authSessionTtlSeconds = Math.min(86400, Math.max(900, Number(process.env.A
 const runDbMigrations = !isProduction || process.env.DB_RUN_MIGRATIONS === 'true';
 const allowedSources = new Set(['DDS', 'MERCADO_LIVRE', 'LOGICA_FF', 'FF_LOCADORA']);
 const xptBases = new Set(['ARAPUTANGA - EMR14', 'ARAXA - EMG34', 'CACERES - EMR6', 'CHAPADAO DO SUL - EGO17', 'CONCEICAO DO MATO DENTRO - EMG26', 'GUANHAES - EMG37', 'GUAXUPE - EMG7', 'MINACU - EDF10', 'MOZARLANDIA - EGO11', 'PONTES E LACERDA - EMR16', 'SANTO ANTONIO DA PLATINA - EPR7'].map(value => value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase()));
-const publicFiles = new Set(['index.html', 'styles.css', 'layout-overrides.css', 'period-utils.js', 'ff-bonus.js', 'spot-bonus.js', 'app.js', 'alc-logo.png', 'favicon.png', 'login.html', 'login.js']);
+const publicFiles = new Set(['index.html', 'styles.css', 'layout-overrides.css', 'period-utils.js', 'period-selection.js', 'ff-bonus.js', 'spot-bonus.js', 'app.js', 'alc-logo.png', 'favicon.png', 'login.html', 'login.js']);
 const publicOutputFiles = new Set(['dispatcher_bases.json', 'ff_logic_rows.json', 'ff_logic_summary.json', 'ff_routes.json', 'ff_summary.json', 'fleet_reference.json', 'spot_routes.json', 'spot_summary.json', 'xpt_bases.json']);
+const staticJsonCache = new Map();
 const mime = {'.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.png': 'image/png', '.jpg': 'image/jpeg', '.csv': 'text/csv; charset=utf-8'};
 const { Pool } = pg;
 const pool = process.env.DATABASE_URL ? new Pool({
@@ -66,16 +68,45 @@ async function redisReady() {
   }
   return Boolean(redis.isReady);
 }
-async function cachedJson(key, ttlSeconds, load) {
+function logPerformance(event, details) { console.info(JSON.stringify({event, ...details})); }
+async function cachedJson(key, ttlSeconds, load, operation = 'cached-json') {
+  const startedAt = performance.now();
+  let cacheState = 'unavailable', redisGetMs = 0, loaderMs = 0, cacheSerializeMs = 0, redisSetMs = 0, payloadBytes = null;
   if (await redisReady()) {
-    try { const value = await redis.get(key); if (value !== null) return JSON.parse(value); } catch { /* Cache outage falls through to PostgreSQL. */ }
+    const getStartedAt = performance.now();
+    try {
+      const value = await redis.get(key);
+      redisGetMs = Math.round(performance.now() - getStartedAt);
+      cacheState = value === null ? 'miss' : 'hit';
+      if (value !== null) {
+        const parseStartedAt = performance.now();
+        const body = JSON.parse(value);
+        logPerformance('cache-performance', {operation, cache: cacheState, redisGetMs, parseMs: Math.round(performance.now() - parseStartedAt), payloadBytes: Buffer.byteLength(value), totalMs: Math.round(performance.now() - startedAt)});
+        return body;
+      }
+    } catch { cacheState = 'error'; redisGetMs = Math.round(performance.now() - getStartedAt); /* Cache outage falls through to PostgreSQL. */ }
   }
-  if (cacheLoads.has(key)) return cacheLoads.get(key);
+  if (cacheLoads.has(key)) {
+    const body = await cacheLoads.get(key);
+    logPerformance('cache-performance', {operation, cache: 'in-flight-deduplicated', redisGetMs, payloadBytes: Buffer.byteLength(JSON.stringify(body)), totalMs: Math.round(performance.now() - startedAt)});
+    return body;
+  }
   const pending = (async () => {
+    const loadStartedAt = performance.now();
     const value = await load();
+    loaderMs = Math.round(performance.now() - loadStartedAt);
     if (await redisReady()) {
-      try { await redis.set(key, JSON.stringify(value), {EX: ttlSeconds}); } catch { /* Cache outage does not affect the response. */ }
+      try {
+        const serializeStartedAt = performance.now();
+        const serialized = JSON.stringify(value);
+        cacheSerializeMs = Math.round(performance.now() - serializeStartedAt);
+        payloadBytes = Buffer.byteLength(serialized);
+        const setStartedAt = performance.now();
+        await redis.set(key, serialized, {EX: ttlSeconds});
+        redisSetMs = Math.round(performance.now() - setStartedAt);
+      } catch { /* Cache outage does not affect the response. */ }
     }
+    logPerformance('cache-performance', {operation, cache: cacheState, redisGetMs, loaderMs, cacheSerializeMs, redisSetMs, payloadBytes, totalMs: Math.round(performance.now() - startedAt)});
     return value;
   })().finally(() => cacheLoads.delete(key));
   cacheLoads.set(key, pending);
@@ -84,6 +115,10 @@ async function cachedJson(key, ttlSeconds, load) {
 async function invalidateCache(...keys) {
   if (!keys.length || !(await redisReady())) return;
   try { await redis.del(keys); } catch { /* Cache outage does not affect committed writes. */ }
+}
+async function invalidateCachePrefix(prefix) {
+  if (!(await redisReady())) return;
+  try { const keys = []; for await (const key of redis.scanIterator({MATCH: `${prefix}*`, COUNT: 100})) keys.push(key); if (keys.length) await redis.del(keys); } catch { /* Cache outage does not affect committed writes. */ }
 }
 function clientIp(req) {
   if (process.env.TRUST_PROXY === 'true') { const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim(); if (forwarded) return forwarded.slice(0, 80); }
@@ -108,7 +143,7 @@ function securityHeaders(res) {
   res.setHeader('Content-Security-Policy', ["default-src 'self'", "script-src 'self' https://cdn.sheetjs.com", "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com", "img-src 'self' data:", "connect-src 'self'", "font-src 'self' data: https://fonts.gstatic.com", "object-src 'none'", "base-uri 'self'", "form-action 'self'", "frame-ancestors 'none'"].join('; '));
   if (isProduction) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
 }
-function sendJson(res, status, body, requestId) { if (requestId) res.setHeader('X-Request-Id', requestId); res.setHeader('content-type', 'application/json; charset=utf-8'); res.statusCode = status; res.end(JSON.stringify(body)); }
+function sendJson(res, status, body, requestId, performanceOperation = '') { if (requestId) res.setHeader('X-Request-Id', requestId); res.setHeader('content-type', 'application/json; charset=utf-8'); res.statusCode = status; const startedAt = performance.now(), payload = JSON.stringify(body), payloadBytes = Buffer.byteLength(payload); res.setHeader('content-length', String(payloadBytes)); if (performanceOperation) logPerformance('api-response-performance', {operation: performanceOperation, status, serializationMs: Math.round(performance.now() - startedAt), payloadBytes, requestId}); res.end(payload); }
 function sendError(res, error, requestId) { const status = error instanceof HttpError ? error.status : 500, code = error instanceof HttpError ? error.code : 'internal-error'; if (!(error instanceof HttpError)) console.error(JSON.stringify({requestId, error: error?.message || 'unknown-error'})); sendJson(res, status, {error: code, requestId}, requestId); }
 function normalizeKey(value) { return String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
 function stableJson(value) { if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`; if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`; return JSON.stringify(value); }
@@ -120,19 +155,35 @@ function normalizeRow(row) { if (!row || typeof row !== 'object' || Array.isArra
 async function readJson(req, maxBytes) { const declared = Number(req.headers['content-length'] || 0); if (declared && declared > maxBytes) throw new HttpError(413, 'payload-too-large'); if (!String(req.headers['content-type'] || '').toLowerCase().startsWith('application/json')) throw new HttpError(415, 'json-required'); const chunks = []; let size = 0; for await (const chunk of req) { size += chunk.length; if (size > maxBytes) throw new HttpError(413, 'payload-too-large'); chunks.push(chunk); } try { const body = JSON.parse(Buffer.concat(chunks).toString('utf8')); if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('invalid'); return body; } catch { throw new HttpError(400, 'invalid-json'); } }
 
 function recordKey(row, index) { const value = row?.['Rota Logistics'] ?? row?.['ROTA LOGISTICS'] ?? row?.rotaLogistics ?? row?.rotalogistics ?? row?.rota, date = row?.Data ?? row?.data ?? row?.Date ?? row?.date ?? row?.['Data da rota'] ?? '', plate = row?.PLACA ?? row?.Placa ?? row?.placa ?? row?.Plate ?? row?.plate ?? '', delivery = row?.['ID Entrega'] ?? row?.idEntrega ?? row?.identrega ?? row?.Pedido ?? row?.pedido ?? row?.shipment ?? '', route = String(value ?? '').trim(), raw = delivery ? `${route}|${date}|${plate}|${delivery}` : route ? `${route}|${date}|${plate}` : stableJson(row) || String(index); return createHash('sha256').update(raw.toUpperCase()).digest('hex'); }
-function importPeriod(value) { const text = String(value ?? '').trim(); if (!text) return ''; const iso = text.match(/^(\d{4})[-/](\d{1,2})/); if (iso) return `${iso[1]}-${String(Number(iso[2])).padStart(2, '0')}`; const slash = text.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/); if (slash) return `${slash[3]}-${String(Number(slash[2])).padStart(2, '0')}`; const parsed = new Date(text); return Number.isNaN(parsed.getTime()) ? '' : `${parsed.getUTCFullYear()}-${String(parsed.getUTCMonth() + 1).padStart(2, '0')}`; }
+function importPeriod(value) { const text = String(value ?? '').trim(); if (!text) return ''; const iso = text.match(/^(\d{4})[-/](\d{1,2})/); if (iso && Number(iso[2]) >= 1 && Number(iso[2]) <= 12) return `${iso[1]}-${String(Number(iso[2])).padStart(2, '0')}`; const slash = text.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/); if (slash && Number(slash[2]) >= 1 && Number(slash[2]) <= 12) return `${slash[3]}-${String(Number(slash[2])).padStart(2, '0')}`; const excelSerial = text.match(/^(\d{5})(?:\.\d+)?$/); if (excelSerial) { const date = new Date(Date.UTC(1899, 11, 30) + Math.floor(Number(text)) * 86400000); if (!Number.isNaN(date.getTime())) return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`; } const parsed = new Date(text); return Number.isNaN(parsed.getTime()) ? '' : `${parsed.getUTCFullYear()}-${String(parsed.getUTCMonth() + 1).padStart(2, '0')}`; }
+function importedDateKey(value) { const text = String(value ?? '').trim(); if (!text) return ''; let year, month, day; const iso = text.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/), dmy = text.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/); if (iso) [, year, month, day] = iso; else if (dmy) [, day, month, year] = dmy; else { const serial = text.match(/^(\d{1,7})(?:\.\d+)?$/); if (serial && Number(text) > 0 && Number(text) <= 2958465) { const date = new Date(Date.UTC(1899, 11, 30) + Math.floor(Number(text)) * 86400000); if (!Number.isNaN(date.getTime())) return date.toISOString().slice(0, 10); } else { const date = new Date(text); if (!Number.isNaN(date.getTime())) return date.toISOString().slice(0, 10); } } year = Number(year); month = Number(month); day = Number(day); const date = new Date(Date.UTC(year, month - 1, day)); return year >= 1 && year <= 9999 && date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day ? `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}` : ''; }
 function operationPeriod(value) { const match = String(value || '').match(/^(\d{4}-(?:0[1-9]|1[0-2]))(?::([12]))?$/); return match ? {key: match[0], month: match[1], part: match[2] || 'monthly'} : null; }
 function operationPeriodContains(date, selected) { const key = String(date || '').slice(0, 10); if (!selected || !/^\d{4}-\d{2}-\d{2}$/.test(key) || key.slice(0, 7) !== selected.month) return false; const day = Number(key.slice(8, 10)); return selected.part === '1' ? day <= 15 : selected.part === '2' ? day >= 16 : true; }
+function selectedOperationPeriods(periods) { const parsed = [...new Set(periods)].map(operationPeriod).filter(Boolean), months = new Set(parsed.filter(item => item.part === 'monthly').map(item => item.month)); return parsed.filter(item => item.part === 'monthly' || !months.has(item.month)).slice(0, 12).map(item => item.key); }
 function operationPeriodDays(selected) { if (!selected) return 0; if (selected.part === '1') return 15; const [year, month] = selected.month.split('-').map(Number); const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate(); return selected.part === '2' ? Math.max(0, daysInMonth - 15) : daysInMonth; }
-function importedRowPeriod(row) { for (const [key, value] of Object.entries(row || {})) { const normalized = normalizeKey(key); if (normalized === 'data' || normalized === 'date' || normalized.includes('datadarota') || normalized.includes('datadodispatch') || normalized.includes('datadispatch')) { const period = importPeriod(value); if (period) return period; } } return ''; }
+function importPeriodDateRanges(periods) {
+  return selectedOperationPeriods(periods).map(value => {
+    const selected = operationPeriod(value), [year, month] = selected.month.split('-').map(Number);
+    const startDay = selected.part === '2' ? 16 : 1;
+    const end = selected.part === '1' ? `${selected.month}-16` : new Date(Date.UTC(year, month, 1)).toISOString().slice(0, 10);
+    return {start: `${selected.month}-${String(startDay).padStart(2, '0')}`, end};
+  });
+}
+function importDateKeyPriority(key) { const normalized = normalizeKey(key), base = normalized.replace(/\d+$/, ''); return ['data', 'date', 'datadarota', 'datadodispatch', 'datadispatch'].indexOf(base); }
+function importedRowDate(row) { const candidates = Object.entries(row || {}).map(([key, value], index) => ({value, index, priority: importDateKeyPriority(key)})).filter(candidate => candidate.priority >= 0).sort((a, b) => a.priority - b.priority || a.index - b.index); return candidates.find(candidate => importPeriod(candidate.value))?.value ?? ''; }
+function importedRowPeriod(row) { return importPeriod(importedRowDate(row)); }
+function validateImportDates(sourceType, rows) { if (['DDS', 'MERCADO_LIVRE', 'LOGICA_FF'].includes(sourceType) && !rows.some(row => importedRowPeriod(row))) throw new HttpError(400, 'import-date-column-unrecognized'); }
+function sqlImportDateValue(jsonValue) { const key = "lower(regexp_replace(k.key, '[^a-zA-Z0-9]', '', 'g'))", baseKey = `regexp_replace(${key}, '[0-9]+$', '')`; return `(SELECT BTRIM(k.value) FROM jsonb_each_text(${jsonValue}) AS k(key, value) WHERE ${baseKey} IN ('data', 'date', 'datadarota', 'datadodispatch', 'datadispatch') AND NULLIF(BTRIM(k.value), '') IS NOT NULL ORDER BY array_position(ARRAY['data', 'date', 'datadarota', 'datadodispatch', 'datadispatch'], ${baseKey}), k.key LIMIT 1)`; }
+function sqlImportRouteDate(value) { const iso = `(regexp_match(${value}, '^([0-9]{4})[-/]([0-9]{1,2})[-/]([0-9]{1,2})'))`, dmy = `(regexp_match(${value}, '^([0-9]{1,2})[/-]([0-9]{1,2})[/-]([0-9]{4})'))`, valid = (year, month, day) => `(${month} BETWEEN 1 AND 12 AND ${day} BETWEEN 1 AND CASE WHEN ${month} = 2 THEN CASE WHEN mod(${year}, 400) = 0 OR (mod(${year}, 4) = 0 AND mod(${year}, 100) <> 0) THEN 29 ELSE 28 END WHEN ${month} IN (4, 6, 9, 11) THEN 30 ELSE 31 END)`; return `CASE WHEN ${value} ~ '^[0-9]{4}[-/][0-9]{1,2}[-/][0-9]{1,2}' THEN CASE WHEN ${valid(`${iso}[1]::int`, `${iso}[2]::int`, `${iso}[3]::int`)} THEN make_date(${iso}[1]::int, ${iso}[2]::int, ${iso}[3]::int) END WHEN ${value} ~ '^[0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{4}' THEN CASE WHEN ${valid(`${dmy}[3]::int`, `${dmy}[2]::int`, `${dmy}[1]::int`)} THEN make_date(${dmy}[3]::int, ${dmy}[2]::int, ${dmy}[1]::int) END WHEN ${value} ~ '^[0-9]{1,7}(\\.[0-9]+)?$' AND ${value}::numeric BETWEEN 1 AND 2958465 THEN DATE '1899-12-30' + floor(${value}::numeric)::int END`; }
 function publicPath(urlPath) { let decoded; try { decoded = decodeURIComponent(urlPath.split('?')[0]); } catch { return null; } const clean = (decoded === '/' ? '/index.html' : decoded).replace(/^\/+/, ''); if (clean.includes('..') || clean.includes('\\') || clean.startsWith('.')) return null; if (publicFiles.has(clean)) return join(root, clean); const prefix = 'outputs/thread-01/'; if (clean.startsWith(prefix) && publicOutputFiles.has(clean.slice(prefix.length))) return join(root, clean); return null; }
+async function readStaticJson(file) { if (!staticJsonCache.has(file)) staticJsonCache.set(file, readFile(file, 'utf8').then(JSON.parse)); return staticJsonCache.get(file); }
 function ipAllowlistAllows(req) { const allowlist = String(process.env.ADMIN_IP_ALLOWLIST || '').split(',').map(value => value.trim()).filter(Boolean); return !allowlist.length || allowlist.includes('*') || allowlist.includes(clientIp(req)); }
 function mutationAllowed(req) { if (!isProduction) return process.env.ADMIN_MUTATIONS_ENABLED !== 'false'; if (process.env.ADMIN_MUTATIONS_ENABLED !== 'true') return false; return ipAllowlistAllows(req); }
 function privateAdminReadAllowed(req) { if (!isProduction) return true; if (process.env.ADMIN_READ_ENABLED !== 'true') return false; return ipAllowlistAllows(req); }
 function cookieValue(req, name) { const cookies = String(req.headers.cookie || '').split(';').map(item => item.trim()); const prefix = `${name}=`; return cookies.find(item => item.startsWith(prefix))?.slice(prefix.length) || ''; }
 const rolePermissions = Object.freeze({
-  manager: Object.freeze({views: ['dashboard', 'rotas', 'bases', 'comparativo', 'regras', 'importar', 'notas'], canUploadInvoice: true, canManageTeams: true, canManageImports: true, canViewInvoices: true}),
-  coordinator: Object.freeze({views: ['dashboard', 'rotas', 'bases', 'comparativo'], canUploadInvoice: true, canManageTeams: false, canManageImports: false, canViewInvoices: false}),
+  manager: Object.freeze({views: ['dashboard', 'rotas', 'bases', 'comparativo', 'dispatchers', 'regras', 'importar', 'notas'], canUploadInvoice: true, canManageTeams: true, canManageImports: true, canViewInvoices: true}),
+  coordinator: Object.freeze({views: ['dashboard', 'rotas', 'bases', 'comparativo', 'dispatchers'], canUploadInvoice: true, canManageTeams: true, canManageImports: false, canViewInvoices: false}),
   dispatcher: Object.freeze({views: ['dashboard', 'rotas', 'bases', 'comparativo'], canUploadInvoice: false, canManageTeams: false, canManageImports: false, canViewInvoices: false})
 });
 function configuredUsers() {
@@ -202,6 +253,7 @@ async function initDatabase() {
     CREATE UNIQUE INDEX IF NOT EXISTS import_batches_content_idx ON import_batches(source_type, content_hash) WHERE content_hash IS NOT NULL;
     CREATE TABLE IF NOT EXISTS import_records (source_type TEXT NOT NULL, record_key TEXT NOT NULL, batch_id BIGINT NOT NULL REFERENCES import_batches(id) ON DELETE CASCADE, data JSONB NOT NULL, imported_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), deleted_at TIMESTAMPTZ, PRIMARY KEY (source_type, record_key));
     ALTER TABLE import_records ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+    ALTER TABLE import_records ADD COLUMN IF NOT EXISTS route_date DATE;
     CREATE INDEX IF NOT EXISTS import_records_batch_idx ON import_records(batch_id);
     CREATE INDEX IF NOT EXISTS import_batches_imported_at_idx ON import_batches(imported_at DESC);
     CREATE TABLE IF NOT EXISTS base_team_configs (base TEXT PRIMARY KEY, coordinator TEXT NOT NULL DEFAULT '', dispatchers JSONB NOT NULL DEFAULT '[]'::jsonb, ff_recipient TEXT NOT NULL DEFAULT '', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
@@ -214,7 +266,20 @@ async function initDatabase() {
     CREATE INDEX IF NOT EXISTS audit_events_created_idx ON audit_events(created_at DESC);
     CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, ip TEXT, user_agent TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
     CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions(expires_at);
+    CREATE TABLE IF NOT EXISTS app_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
   `);
+  const migrationClient = await pool.connect();
+  try {
+    await migrationClient.query('BEGIN');
+    await migrationClient.query('SELECT pg_advisory_xact_lock(731904210)');
+    const migration = await migrationClient.query("SELECT 1 FROM app_migrations WHERE name='2026-10-route-date-v1'");
+    if (!migration.rowCount) {
+      await migrationClient.query(`UPDATE import_records r SET route_date = ${sqlImportRouteDate(sqlImportDateValue('r.data'))} WHERE r.route_date IS NULL`);
+      await migrationClient.query('CREATE INDEX IF NOT EXISTS import_records_active_period_idx ON import_records(source_type, route_date) WHERE deleted_at IS NULL');
+      await migrationClient.query("INSERT INTO app_migrations (name) VALUES ('2026-10-route-date-v1')");
+    }
+    await migrationClient.query('COMMIT');
+  } catch (error) { await migrationClient.query('ROLLBACK'); throw error; } finally { migrationClient.release(); }
   let missing;
   do {
     missing = await pool.query('SELECT id FROM invoices WHERE public_token IS NULL LIMIT 1000');
@@ -244,14 +309,15 @@ async function logout(req, res) {
   return {authenticated: false};
 }
 
-async function importPeriodSummary(period) { if (!pool) return {period, sources: {}}; if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(period)) throw new HttpError(400, 'period-invalid'); const result = await pool.query("SELECT source_type, data FROM import_records WHERE deleted_at IS NULL AND source_type = ANY($1::text[])", [['DDS', 'MERCADO_LIVRE', 'LOGICA_FF']]); const sources = {}; for (const row of result.rows) if (importedRowPeriod(row.data) === period) sources[row.source_type] = (sources[row.source_type] || 0) + 1; return {period, sources: Object.fromEntries(Object.entries(sources).map(([source, records]) => [source, {records}]))}; }
-async function removeImportPeriod(period, req) { if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(period)) throw new HttpError(400, 'period-invalid'); if (!pool) throw new HttpError(503, 'database-not-configured'); const client = await pool.connect(); try { await client.query('BEGIN'); const result = await client.query("SELECT source_type, record_key, data FROM import_records WHERE deleted_at IS NULL AND source_type = ANY($1::text[])", [['DDS', 'MERCADO_LIVRE', 'LOGICA_FF']]); const grouped = {}; for (const row of result.rows) if (importedRowPeriod(row.data) === period) (grouped[row.source_type] ||= []).push(row.record_key); for (const [source, keys] of Object.entries(grouped)) if (keys.length) await client.query('UPDATE import_records SET deleted_at=NOW() WHERE source_type=$1 AND record_key=ANY($2::text[])', [source, keys]); await audit(client, 'archive-import-period', 'import-period', period, req, {counts: Object.fromEntries(Object.entries(grouped).map(([source, keys]) => [source, keys.length]))}); await client.query('COMMIT'); return {period, archived: Object.fromEntries(Object.entries(grouped).map(([source, keys]) => [source, keys.length]))}; } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); } }
+async function importPeriodSummary(period) { if (!pool) return {period, sources: {}}; if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(period)) throw new HttpError(400, 'period-invalid'); const result = await pool.query(`SELECT source_type, COUNT(*)::int AS records FROM import_records WHERE deleted_at IS NULL AND source_type = ANY($1::text[]) AND route_date >= make_date(split_part($2, '-', 1)::int, split_part($2, '-', 2)::int, 1) AND route_date < (make_date(split_part($2, '-', 1)::int, split_part($2, '-', 2)::int, 1) + INTERVAL '1 month')::date GROUP BY source_type`, [['DDS', 'MERCADO_LIVRE', 'LOGICA_FF'], period]); return {period, sources: Object.fromEntries(result.rows.map(row => [row.source_type, {records: row.records}]))}; }
+async function removeImportPeriod(period, req) { if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(period)) throw new HttpError(400, 'period-invalid'); if (!pool) throw new HttpError(503, 'database-not-configured'); const client = await pool.connect(); try { await client.query('BEGIN'); const result = await client.query("SELECT source_type, record_key FROM import_records WHERE deleted_at IS NULL AND source_type = ANY($1::text[]) AND route_date >= make_date(split_part($2, '-', 1)::int, split_part($2, '-', 2)::int, 1) AND route_date < (make_date(split_part($2, '-', 1)::int, split_part($2, '-', 2)::int, 1) + INTERVAL '1 month')::date", [['DDS', 'MERCADO_LIVRE', 'LOGICA_FF'], period]); const grouped = {}; for (const row of result.rows) (grouped[row.source_type] ||= []).push(row.record_key); for (const [source, keys] of Object.entries(grouped)) if (keys.length) await client.query('UPDATE import_records SET deleted_at=NOW() WHERE source_type=$1 AND record_key=ANY($2::text[])', [source, keys]); await audit(client, 'archive-import-period', 'import-period', period, req, {counts: Object.fromEntries(Object.entries(grouped).map(([source, keys]) => [source, keys.length]))}); await client.query('COMMIT'); return {period, archived: Object.fromEntries(Object.entries(grouped).map(([source, keys]) => [source, keys.length]))}; } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); } }
 
 async function persistImport(payload, req) {
   if (!pool) throw new HttpError(503, 'database-not-configured');
   const sourceType = safeText(payload.sourceType, 'source-type', 50, true).toUpperCase(); if (!allowedSources.has(sourceType)) throw new HttpError(400, 'source-type-invalid');
   const fileName = safeFileName(payload.fileName, 'importacao.xlsx'), extension = fileExtension(fileName); if (!['.xlsx', '.csv'].includes(extension)) throw new HttpError(400, 'file-extension-invalid');
   const fileData = decodeBase64(payload.fileBase64, maxImportFile), rows = Array.isArray(payload.rows) ? payload.rows.map(normalizeRow) : []; if (!rows.length || rows.length > maxRows) throw new HttpError(400, 'rows-invalid');
+  validateImportDates(sourceType, rows);
   const unique = new Map(); rows.forEach((row, index) => unique.set(recordKey(row, index), row)); const uniqueRows = [...unique.entries()];
   const contentHash = createHash('sha256').update(sourceType).update(fileData).update(stableJson(uniqueRows.map(([, row]) => row))).digest('hex');
   const alreadyImported = await pool.query('SELECT id FROM import_batches WHERE source_type=$1 AND content_hash=$2', [sourceType, contentHash]);
@@ -259,40 +325,94 @@ async function persistImport(payload, req) {
   if (!await consumeRateLimit(req, 'import')) throw new HttpError(429, 'rate-limit-exceeded');
   const client = await pool.connect(); try { await client.query('BEGIN'); const existing = await client.query('SELECT id FROM import_batches WHERE source_type=$1 AND content_hash=$2', [sourceType, contentHash]); if (existing.rowCount) { await client.query('COMMIT'); return {batchId: Number(existing.rows[0].id), rowsReceived: rows.length, recordsUpserted: 0, idempotent: true}; }
     const batch = await client.query('INSERT INTO import_batches (source_type,file_name,mime_type,file_size,row_count,file_data,content_hash) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id', [sourceType, fileName, extension === '.csv' ? 'text/csv' : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', fileData.length, rows.length, fileData, contentHash]); const batchId = Number(batch.rows[0].id); let upserted = 0;
-    for (let offset = 0; offset < uniqueRows.length; offset += 250) { const chunk = uniqueRows.slice(offset, offset + 250), values = [], placeholders = chunk.map(([key, row], index) => { const p = index * 4; values.push(sourceType, key, batchId, JSON.stringify(row)); return `($${p + 1},$${p + 2},$${p + 3},$${p + 4},NOW(),NULL)`; }); await client.query(`INSERT INTO import_records (source_type,record_key,batch_id,data,imported_at,deleted_at) VALUES ${placeholders.join(',')} ON CONFLICT (source_type,record_key) DO UPDATE SET batch_id=EXCLUDED.batch_id,data=EXCLUDED.data,imported_at=NOW(),deleted_at=NULL`, values); upserted += chunk.length; }
+    for (let offset = 0; offset < uniqueRows.length; offset += 250) { const chunk = uniqueRows.slice(offset, offset + 250), values = [], placeholders = chunk.map(([key, row], index) => { const p = index * 5; values.push(sourceType, key, batchId, JSON.stringify(row), importedDateKey(importedRowDate(row)) || null); return `($${p + 1},$${p + 2},$${p + 3},$${p + 4},$${p + 5},NOW(),NULL)`; }); await client.query(`INSERT INTO import_records (source_type,record_key,batch_id,data,route_date,imported_at,deleted_at) VALUES ${placeholders.join(',')} ON CONFLICT (source_type,record_key) DO UPDATE SET batch_id=EXCLUDED.batch_id,data=EXCLUDED.data,route_date=EXCLUDED.route_date,imported_at=NOW(),deleted_at=NULL`, values); upserted += chunk.length; }
     await audit(client, 'import-upsert', 'import-batch', batchId, req, {sourceType, rowsReceived: rows.length, recordsUpserted: upserted, contentHash}); await client.query('COMMIT'); return {batchId, rowsReceived: rows.length, recordsUpserted: upserted, idempotent: false};
   } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
 }
 
-async function latestImports() { if (!pool) return {sources: {}}; const result = await pool.query(`WITH latest AS (SELECT DISTINCT ON (source_type) id, source_type, file_name, imported_at FROM import_batches WHERE source_type = ANY($1::text[]) ORDER BY source_type, imported_at DESC, id DESC) SELECT l.source_type, l.file_name, l.imported_at, COALESCE(json_agg(r.data ORDER BY r.record_key) FILTER (WHERE r.data IS NOT NULL), '[]'::json) AS rows FROM latest l LEFT JOIN import_records r ON r.source_type=l.source_type AND r.deleted_at IS NULL GROUP BY l.source_type, l.file_name, l.imported_at`, [['DDS', 'MERCADO_LIVRE', 'LOGICA_FF', 'FF_LOCADORA']]); return {sources: Object.fromEntries(result.rows.map(row => [row.source_type, {fileName: row.file_name, importedAt: row.imported_at, rows: row.rows}]))}; }
+async function latestImports(periods = []) {
+  if (!pool) return {sources: {}};
+  const selectedPeriods = selectedOperationPeriods(periods);
+  if (!selectedPeriods.length) throw new HttpError(400, 'import-period-required');
+  const ranges = importPeriodDateRanges(selectedPeriods), starts = ranges.map(range => range.start), ends = ranges.map(range => range.end), queryStartedAt = performance.now();
+  const result = await pool.query(`WITH latest AS (
+      SELECT DISTINCT ON (source_type) id, source_type, file_name, imported_at
+      FROM import_batches WHERE source_type = ANY($1::text[])
+      ORDER BY source_type, imported_at DESC, id DESC
+    )
+    SELECT l.source_type, l.file_name, l.imported_at,
+      COALESCE(json_agg(r.data) FILTER (WHERE r.data IS NOT NULL), '[]'::json) AS rows
+    FROM latest l
+    LEFT JOIN import_records r ON r.source_type=l.source_type AND r.deleted_at IS NULL
+      AND (l.source_type = 'FF_LOCADORA' OR EXISTS (
+        SELECT 1 FROM unnest($2::date[], $3::date[]) AS requested(start_date, end_date)
+        WHERE r.route_date >= requested.start_date AND r.route_date < requested.end_date
+      ))
+    GROUP BY l.source_type, l.file_name, l.imported_at`, [['DDS', 'MERCADO_LIVRE', 'LOGICA_FF', 'FF_LOCADORA'], starts, ends]);
+  logPerformance('database-query-performance', {operation: 'imports-latest', durationMs: Math.round(performance.now() - queryStartedAt), sourceGroups: result.rowCount, selectedPeriodCount: selectedPeriods.length});
+  return {periods: selectedPeriods, sources: Object.fromEntries(result.rows.map(row => [row.source_type, {fileName: row.file_name, importedAt: row.imported_at, rows: row.rows}]))};
+}
 async function latestImportStatus() { if (!pool) return {sources: {}}; const result = await pool.query(`SELECT DISTINCT ON (source_type) source_type, file_name, imported_at, row_count FROM import_batches WHERE source_type = ANY($1::text[]) ORDER BY source_type, imported_at DESC, id DESC`, [['DDS', 'MERCADO_LIVRE', 'LOGICA_FF', 'FF_LOCADORA']]); return {sources: Object.fromEntries(result.rows.map(row => [row.source_type, {fileName: row.file_name, importedAt: row.imported_at, rowCount: row.row_count}]))}; }
 async function importCatalog() {
   if (!pool) return {sources: {}};
-  const result = await pool.query(`SELECT r.source_type, r.data, b.file_name, b.imported_at
-    FROM import_records r
-    JOIN import_batches b ON b.id = r.batch_id
-    WHERE r.deleted_at IS NULL AND r.source_type = ANY($1::text[])
-    ORDER BY r.source_type, b.imported_at DESC`, [['DDS', 'MERCADO_LIVRE', 'LOGICA_FF', 'FF_LOCADORA']]);
+  const queryStartedAt = performance.now();
+  const result = await pool.query(`WITH periods AS (
+    SELECT r.source_type, COALESCE(to_char(r.route_date, 'YYYY-MM'), 'sem-periodo') AS period,
+      EXTRACT(DAY FROM r.route_date)::int AS day_of_month,
+      b.file_name, b.imported_at
+    FROM import_records r JOIN import_batches b ON b.id=r.batch_id
+    WHERE r.deleted_at IS NULL AND r.source_type=ANY($1::text[])
+  )
+  SELECT source_type, period, COUNT(*)::int AS rows,
+    COUNT(*) FILTER (WHERE day_of_month BETWEEN 1 AND 15)::int AS first_quinzena_rows,
+    COUNT(*) FILTER (WHERE day_of_month BETWEEN 16 AND 31)::int AS second_quinzena_rows,
+    (array_agg(file_name ORDER BY imported_at DESC))[1] AS file_name,
+    MAX(imported_at) AS imported_at
+  FROM periods GROUP BY source_type, period ORDER BY source_type, period DESC`, [['DDS', 'MERCADO_LIVRE', 'LOGICA_FF', 'FF_LOCADORA']]);
+  logPerformance('database-query-performance', {operation: 'imports-catalog', durationMs: Math.round(performance.now() - queryStartedAt), periodGroups: result.rowCount});
   const grouped = {};
   for (const row of result.rows) {
     const source = row.source_type;
-    const period = importedRowPeriod(row.data) || 'sem-periodo';
+    const period = row.period;
     const sourceGroup = grouped[source] ||= {totalRows: 0, periods: {}};
-    const periodGroup = sourceGroup.periods[period] ||= {period, rows: 0, fileName: row.file_name, importedAt: row.imported_at};
-    sourceGroup.totalRows += 1;
-    periodGroup.rows += 1;
-    if (new Date(row.imported_at) > new Date(periodGroup.importedAt)) {
-      periodGroup.fileName = row.file_name;
-      periodGroup.importedAt = row.imported_at;
-    }
+    sourceGroup.totalRows += Number(row.rows || 0);
+    sourceGroup.periods[period] = {period, rows: Number(row.rows || 0), firstQuinzenaRows: Number(row.first_quinzena_rows || 0), secondQuinzenaRows: Number(row.second_quinzena_rows || 0), fileName: row.file_name, importedAt: row.imported_at};
   }
   return {sources: Object.fromEntries(Object.entries(grouped).map(([source, value]) => [source, {totalRows: value.totalRows, periods: Object.values(value.periods).sort((a, b) => String(b.period).localeCompare(String(a.period)))}]))};
 }
-async function listTeamConfigs() { if (!pool) return {bases: {}}; const result = await pool.query('SELECT base, coordinator, dispatchers, ff_recipient FROM base_team_configs ORDER BY base'); return {bases: Object.fromEntries(result.rows.map(row => [row.base, {coordinator: row.coordinator, dispatchers: row.dispatchers || [], ffRecipient: row.ff_recipient || ''}]))}; }
-async function saveTeamConfig(payload, req) { if (!pool) throw new HttpError(503, 'database-not-configured'); const base = safeText(payload.base, 'base', 160, true), coordinator = safeText(payload.coordinator, 'coordinator', 160, false); if (!Array.isArray(payload.dispatchers) || payload.dispatchers.length > 100) throw new HttpError(400, 'dispatchers-invalid'); const dispatchers = [...new Set(payload.dispatchers.map(value => safeText(value, 'dispatcher', 160, true)))], ffRecipient = safeText(payload.ffRecipient, 'ff-recipient', 160, false); if (ffRecipient && !dispatchers.includes(ffRecipient)) throw new HttpError(400, 'ff-recipient-invalid'); const client = await pool.connect(); try { await client.query('BEGIN'); await client.query(`INSERT INTO base_team_configs (base,coordinator,dispatchers,ff_recipient,updated_at) VALUES ($1,$2,$3::jsonb,$4,NOW()) ON CONFLICT (base) DO UPDATE SET coordinator=EXCLUDED.coordinator,dispatchers=EXCLUDED.dispatchers,ff_recipient=EXCLUDED.ff_recipient,updated_at=NOW()`, [base, coordinator, JSON.stringify(dispatchers), ffRecipient]); await audit(client, 'team-config-upsert', 'base', base, req, {dispatcherCount: dispatchers.length, hasFfRecipient: Boolean(ffRecipient)}); await client.query('COMMIT'); return {base, coordinator, dispatchers, ffRecipient}; } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); } }
+function isAllowedTeamDispatcherMode(mode, previousMode = '') { return mode === 'ff' || mode === 'spot' || (mode === 'both' && previousMode === 'both'); }
+function normalizeTeamDispatcherConfig(value) { const names = Array.isArray(value) ? value : Array.isArray(value?.names) ? value.names : []; const dispatchers = [...new Set(names.map(name => String(name || '').trim()).filter(Boolean))]; const modes = Object.fromEntries(dispatchers.map(name => [name, ['ff', 'spot', 'both'].includes(value?.modes?.[name]) ? value.modes[name] : 'both'])); return {dispatchers, modes}; }
+function teamModeDispatchers(value, mode) { const team = normalizeTeamDispatcherConfig(value); return team.dispatchers.filter(name => team.modes[name] === mode || team.modes[name] === 'both'); }
+async function listTeamConfigs() { if (!pool) return {bases: {}}; const result = await pool.query('SELECT base, coordinator, dispatchers, ff_recipient FROM base_team_configs ORDER BY base'); return {bases: Object.fromEntries(result.rows.map(row => { const team = normalizeTeamDispatcherConfig(row.dispatchers); return [row.base, {coordinator: row.coordinator, ...team, ffDispatchers: teamModeDispatchers(row.dispatchers, 'ff'), spotDispatchers: teamModeDispatchers(row.dispatchers, 'spot'), ffRecipient: row.ff_recipient || ''}]; }))}; }
+async function saveTeamConfig(payload, req) {
+  if (!pool) throw new HttpError(503, 'database-not-configured');
+  const base = safeText(payload.base, 'base', 160, true), coordinator = safeText(payload.coordinator, 'coordinator', 160, false);
+  if (!Array.isArray(payload.dispatchers) || payload.dispatchers.length > 100) throw new HttpError(400, 'dispatchers-invalid');
+  const dispatchers = [...new Set(payload.dispatchers.map(value => safeText(value, 'dispatcher', 160, true)))];
+  if (new Set(dispatchers.map(value => normalizedPerson(value))).size !== dispatchers.length) throw new HttpError(400, 'dispatchers-duplicate');
+  const dispatcherModes = Object.fromEntries(dispatchers.map(name => [name, payload.dispatcherModes?.[name]]));
+  const ffRecipient = safeText(payload.ffRecipient, 'ff-recipient', 160, false);
+  const savedDispatchers = {names: dispatchers, modes: dispatcherModes};
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const existingResult = dispatchers.some(name => dispatcherModes[name] === 'both')
+      ? await client.query('SELECT dispatchers FROM base_team_configs WHERE base=$1 FOR UPDATE', [base])
+      : {rows: []};
+    const previous = normalizeTeamDispatcherConfig(existingResult.rows[0]?.dispatchers);
+    for (const name of dispatchers) if (!isAllowedTeamDispatcherMode(dispatcherModes[name], previous.modes[name])) throw new HttpError(400, 'dispatcher-mode-invalid');
+    if (ffRecipient && (!dispatchers.includes(ffRecipient) || !['ff', 'both'].includes(dispatcherModes[ffRecipient]))) throw new HttpError(400, 'ff-recipient-invalid');
+    await client.query(`INSERT INTO base_team_configs (base,coordinator,dispatchers,ff_recipient,updated_at) VALUES ($1,$2,$3::jsonb,$4,NOW()) ON CONFLICT (base) DO UPDATE SET coordinator=EXCLUDED.coordinator,dispatchers=EXCLUDED.dispatchers,ff_recipient=EXCLUDED.ff_recipient,updated_at=NOW()`, [base, coordinator, JSON.stringify(savedDispatchers), ffRecipient]);
+    await audit(client, 'team-config-upsert', 'base', base, req, {dispatcherCount: dispatchers.length, modes: dispatcherModes, hasFfRecipient: Boolean(ffRecipient)});
+    await client.query('COMMIT');
+    const normalized = normalizeTeamDispatcherConfig(savedDispatchers);
+    return {base, coordinator, ...normalized, ffDispatchers: teamModeDispatchers(savedDispatchers, 'ff'), spotDispatchers: teamModeDispatchers(savedDispatchers, 'spot'), ffRecipient};
+  } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); }
+}
 
 function allowedBonusCents(mode) { if (mode === 'ff') return new Set([0, ...fixedFleetBonus.bands.map(band => Math.round(band.payout * 100))]); const values = new Set([0]); spotBonus.bands.forEach(band => { for (let count = 1; count <= 100; count += 1) values.add(spotBonus.bonusForCars(band.cars, count).perDispatcherCents); }); return values; }
 function bonusCents(value, mode) { const number = typeof value === 'number' ? value : Number(value); if (!Number.isFinite(number) || number < 0 || number > 10000 || Math.abs(number * 100 - Math.round(number * 100)) > 1e-6) throw new HttpError(400, 'bonus-amount-invalid'); const cents = Math.round(number * 100); if (!allowedBonusCents(mode).has(cents)) throw new HttpError(400, 'bonus-amount-not-in-policy'); return cents; }
+function assertInvoiceBonusEligible(calculatedCents) { if (calculatedCents === null) throw new HttpError(503, 'bonus-eligibility-unavailable'); if (calculatedCents <= 0) throw new HttpError(409, 'invoice-base-not-bonus-eligible'); return calculatedCents; }
 function recordNormalized(row) { return Object.fromEntries(Object.entries(row || {}).map(([key, value]) => [normalizeKey(key), value])); }
 function routeDate(row) { const raw = row.data ?? row.date ?? row.datadarota ?? row.datadispatch ?? row.datadodispatch ?? row.routedate; if (typeof raw === 'number' && raw > 20_000) return new Date(Date.UTC(1899, 11, 30 + raw)).toISOString().slice(0, 10); const text = String(raw ?? '').trim(); const iso = text.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/); if (iso) return `${iso[1]}-${String(Number(iso[2])).padStart(2, '0')}-${String(Number(iso[3])).padStart(2, '0')}`; const dmy = text.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/); if (dmy) return `${dmy[3]}-${String(Number(dmy[2])).padStart(2, '0')}-${String(Number(dmy[1])).padStart(2, '0')}`; const parsed = new Date(text); return Number.isNaN(parsed.getTime()) ? '' : parsed.toISOString().slice(0, 10); }
 function routePeriod(date) { return String(date || '').slice(0, 7); }
@@ -308,7 +428,14 @@ function mercadoIdentity(row) { const r = recordNormalized(row); return {date: r
 async function authoritativeBonusCents(period, mode, base, dispatcher) {
   if (!pool) return null;
   const selectedPeriod = operationPeriod(period); if (!selectedPeriod) throw new HttpError(400, 'period-invalid');
-  const result = await pool.query("SELECT source_type, data FROM import_records WHERE deleted_at IS NULL AND source_type = ANY($1::text[])", [['DDS', 'MERCADO_LIVRE', 'LOGICA_FF', 'FF_LOCADORA']]);
+  const ranges = importPeriodDateRanges([period]), queryStartedAt = performance.now();
+  const result = await pool.query(`SELECT source_type, data FROM import_records
+    WHERE deleted_at IS NULL AND source_type = ANY($1::text[])
+      AND (source_type = 'FF_LOCADORA' OR EXISTS (
+        SELECT 1 FROM unnest($2::date[], $3::date[]) AS requested(start_date, end_date)
+        WHERE import_records.route_date >= requested.start_date AND import_records.route_date < requested.end_date
+      ))`, [['DDS', 'MERCADO_LIVRE', 'LOGICA_FF', 'FF_LOCADORA'], ranges.map(range => range.start), ranges.map(range => range.end)]);
+  logPerformance('database-query-performance', {operation: 'invoice-bonus-inputs', durationMs: Math.round(performance.now() - queryStartedAt), records: result.rowCount, period: selectedPeriod.key});
   const rows = {DDS: [], MERCADO_LIVRE: [], LOGICA_FF: [], FF_LOCADORA: []}; result.rows.forEach(row => rows[row.source_type]?.push(row.data));
   const canonicalBase = canonicalServerBase(base);
   const dds = rows.DDS.map(routeIdentity).filter(row => operationPeriodContains(row.date, selectedPeriod) && row.base === canonicalBase && !isXptServerBase(row.base) && row.plate && row.date && row.cluster.toUpperCase() !== 'ROTA');
@@ -323,13 +450,13 @@ async function authoritativeBonusCents(period, mode, base, dispatcher) {
     const ffRoutes = withDs.filter(row => ffKeys.has(`${row.date}|${normalizedPlate(row.plate)}`));
     const average = ffRoutes.filter(row => Number.isFinite(row.ds)).reduce((sum, row) => sum + row.ds, 0) / (ffRoutes.filter(row => Number.isFinite(row.ds)).length || 1);
     const plannedDays = selectedPeriod.part === 'monthly' ? 26 : 13; const group = logicByBase.get(canonicalBase); const share = group?.plates.size ? group.bipped / (group.plates.size * plannedDays) : null; const payout = average >= .92 && Number.isFinite(share) ? fixedFleetBonus.payoutForUtilization(share) * 100 : 0;
-    const team = await pool.query('SELECT ff_recipient FROM base_team_configs WHERE base=$1', [canonicalBase]); return team.rows[0]?.ff_recipient && team.rows[0].ff_recipient === dispatcher ? payout : 0;
+    const team = await pool.query('SELECT dispatchers, ff_recipient FROM base_team_configs WHERE base=$1', [canonicalBase]); const assigned = team.rowCount ? teamModeDispatchers(team.rows[0].dispatchers, 'ff') : await referenceDispatchers(canonicalBase); return team.rows[0]?.ff_recipient === dispatcher && assigned.includes(dispatcher) ? payout : 0;
   }
-  const spotRoutes = withDs.filter(row => !ffKeys.has(`${row.date}|${normalizedPlate(row.plate)}`) && !fleetPlates.has(normalizedPlate(row.plate)) && Number.isFinite(row.ds) && row.ds >= .92);
-  const days = operationPeriodDays(selectedPeriod), cars = days ? spotRoutes.length / days : 0, team = await pool.query('SELECT dispatchers FROM base_team_configs WHERE base=$1', [canonicalBase]), savedDispatchers = Array.isArray(team.rows[0]?.dispatchers) ? team.rows[0].dispatchers : [], dispatchers = team.rowCount ? savedDispatchers : await referenceDispatchers(canonicalBase), payout = spotBonus.bonusForCars(cars, dispatchers.length || 1); return dispatchers.includes(dispatcher) ? payout.perDispatcherCents : 0;
+  const spotRoutes = withDs.filter(row => row.base === canonicalBase && !ffKeys.has(`${row.date}|${normalizedPlate(row.plate)}`) && !fleetPlates.has(normalizedPlate(row.plate)) && Number.isFinite(row.ds) && row.ds >= .92);
+  const days = operationPeriodDays(selectedPeriod), cars = days ? spotRoutes.length / days : 0, team = await pool.query('SELECT dispatchers FROM base_team_configs WHERE base=$1', [canonicalBase]), dispatchers = team.rowCount ? teamModeDispatchers(team.rows[0].dispatchers, 'spot') : await referenceDispatchers(canonicalBase), payout = spotBonus.bonusForCars(cars, dispatchers.length || 1); return dispatchers.includes(dispatcher) ? payout.perDispatcherCents : 0;
 }
 async function listInvoices() { if (!pool) return {invoices: []}; const result = await pool.query('SELECT public_token AS file_token, period, mode, base, dispatcher, file_name, mime_type, file_size, amount, created_at FROM invoices WHERE deleted_at IS NULL ORDER BY created_at DESC, id DESC'); return {invoices: result.rows}; }
-async function saveInvoice(payload, req) { if (!pool) throw new HttpError(503, 'database-not-configured'); const period = safeText(payload.period, 'period', 9, true), mode = String(payload.mode || '').toLowerCase(), base = safeText(payload.base, 'base', 160, true), dispatcher = safeText(payload.dispatcher, 'dispatcher', 160, true); if (!operationPeriod(period) || !['ff', 'spot'].includes(mode)) throw new HttpError(400, 'invoice-fields-invalid'); const fileName = safeFileName(payload.fileName, 'nota-fiscal.pdf'), extension = fileExtension(fileName), mimeType = new Map([['.pdf', 'application/pdf'], ['.png', 'image/png'], ['.jpg', 'image/jpeg'], ['.jpeg', 'image/jpeg']]).get(extension); if (!mimeType) throw new HttpError(400, 'invoice-extension-invalid'); if (payload.mimeType && !['application/octet-stream', mimeType].includes(String(payload.mimeType).toLowerCase())) throw new HttpError(400, 'invoice-mime-invalid'); const fileData = decodeBase64(payload.fileBase64, maxInvoiceFile), claimedCents = bonusCents(payload.amount, mode), calculatedCents = await authoritativeBonusCents(period, mode, base, dispatcher), amountCents = calculatedCents === null ? claimedCents : calculatedCents; if ((isProduction || process.env.STRICT_SERVER_BONUS === 'true') && calculatedCents !== null && claimedCents !== calculatedCents) throw new HttpError(409, 'bonus-amount-mismatch'); const client = await pool.connect(); try { await client.query('BEGIN'); const result = await client.query(`INSERT INTO invoices (period,mode,base,dispatcher,file_name,mime_type,file_size,amount,file_data,public_token,deleted_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL) ON CONFLICT (period,mode,base,dispatcher) DO UPDATE SET file_name=EXCLUDED.file_name,mime_type=EXCLUDED.mime_type,file_size=EXCLUDED.file_size,amount=EXCLUDED.amount,file_data=EXCLUDED.file_data,deleted_at=NULL,created_at=NOW() RETURNING public_token AS file_token,period,mode,base,dispatcher,file_name,mime_type,file_size,amount,created_at`, [period, mode, base, dispatcher, fileName, mimeType, fileData.length, amountCents / 100, fileData, randomUUID()]); await audit(client, 'invoice-upsert', 'invoice', `${period}:${mode}:${base}:${dispatcher}`, req, {amountCents, fileSize: fileData.length, serverCalculated: calculatedCents !== null}); await client.query('COMMIT'); return result.rows[0]; } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); } }
+async function saveInvoice(payload, req) { if (!pool) throw new HttpError(503, 'database-not-configured'); const period = safeText(payload.period, 'period', 9, true), mode = String(payload.mode || '').toLowerCase(), base = safeText(payload.base, 'base', 160, true), dispatcher = safeText(payload.dispatcher, 'dispatcher', 160, true); if (!operationPeriod(period) || !['ff', 'spot'].includes(mode)) throw new HttpError(400, 'invoice-fields-invalid'); const fileName = safeFileName(payload.fileName, 'nota-fiscal.pdf'), extension = fileExtension(fileName), mimeType = new Map([['.pdf', 'application/pdf'], ['.png', 'image/png'], ['.jpg', 'image/jpeg'], ['.jpeg', 'image/jpeg']]).get(extension); if (!mimeType) throw new HttpError(400, 'invoice-extension-invalid'); if (payload.mimeType && !['application/octet-stream', mimeType].includes(String(payload.mimeType).toLowerCase())) throw new HttpError(400, 'invoice-mime-invalid'); const fileData = decodeBase64(payload.fileBase64, maxInvoiceFile), claimedCents = bonusCents(payload.amount, mode), calculatedCents = await authoritativeBonusCents(period, mode, base, dispatcher), amountCents = assertInvoiceBonusEligible(calculatedCents); if ((isProduction || process.env.STRICT_SERVER_BONUS === 'true') && claimedCents !== amountCents) throw new HttpError(409, 'bonus-amount-mismatch'); const client = await pool.connect(); try { await client.query('BEGIN'); const result = await client.query(`INSERT INTO invoices (period,mode,base,dispatcher,file_name,mime_type,file_size,amount,file_data,public_token,deleted_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL) ON CONFLICT (period,mode,base,dispatcher) DO UPDATE SET file_name=EXCLUDED.file_name,mime_type=EXCLUDED.mime_type,file_size=EXCLUDED.file_size,amount=EXCLUDED.amount,file_data=EXCLUDED.file_data,deleted_at=NULL,created_at=NOW() RETURNING public_token AS file_token,period,mode,base,dispatcher,file_name,mime_type,file_size,amount,created_at`, [period, mode, base, dispatcher, fileName, mimeType, fileData.length, amountCents / 100, fileData, randomUUID()]); await audit(client, 'invoice-upsert', 'invoice', `${period}:${mode}:${base}:${dispatcher}`, req, {amountCents, fileSize: fileData.length, serverCalculated: true}); await client.query('COMMIT'); return result.rows[0]; } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); } }
 async function downloadInvoice(token, res) { if (!pool) throw new HttpError(503, 'database-not-configured'); if (!/^[a-f0-9-]{36}$/i.test(token)) throw new HttpError(400, 'file-token-invalid'); const result = await pool.query('SELECT mime_type, file_data FROM invoices WHERE public_token=$1 AND deleted_at IS NULL', [token]); if (!result.rowCount) throw new HttpError(404, 'not-found'); const row = result.rows[0]; res.setHeader('content-type', row.mime_type || 'application/octet-stream'); res.setHeader('content-disposition', 'attachment; filename="nota-fiscal"'); res.setHeader('cache-control', 'private, no-store'); res.end(row.file_data); }
 async function archiveInvoice(token, req) { if (!pool) throw new HttpError(503, 'database-not-configured'); if (!/^[a-f0-9-]{36}$/i.test(token)) throw new HttpError(400, 'file-token-invalid'); const client = await pool.connect(); try { await client.query('BEGIN'); const result = await client.query('UPDATE invoices SET deleted_at=NOW() WHERE public_token=$1 AND deleted_at IS NULL RETURNING public_token', [token]); if (!result.rowCount) throw new HttpError(404, 'not-found'); await audit(client, 'invoice-archive', 'invoice', token, req); await client.query('COMMIT'); return {archived: true}; } catch (error) { await client.query('ROLLBACK'); throw error; } finally { client.release(); } }
 
@@ -344,14 +471,14 @@ async function routeRequest(req, res) {
     return sendJson(res, 200, {...publicSession(session), expiresAt: session.expiresAt.toISOString()}, requestId);
   }
   if (pathname.startsWith('/api/')) await requireAuth(req);
-  if (pathname === '/api/imports' && req.method === 'POST') { await checkMutation(req, res); const payload = await readJson(req, maxImportPayload), result = await persistImport(payload, req); if (!result.idempotent) { const periodKeys = [...new Set((payload.rows || []).map(importedRowPeriod).filter(Boolean))].map(period => 'bonus:cache:imports:period:' + period); await invalidateCache('bonus:cache:imports:status:v1', 'bonus:cache:imports:catalog:v1', 'bonus:cache:imports:latest:v1', ...periodKeys); } return sendJson(res, 201, result, requestId); }
-  if (pathname === '/api/imports/status' && req.method === 'GET') return sendJson(res, 200, await cachedJson('bonus:cache:imports:status:v1', 60, latestImportStatus), requestId);
-  if (pathname === '/api/imports/catalog' && req.method === 'GET') return sendJson(res, 200, await cachedJson('bonus:cache:imports:catalog:v1', 60, importCatalog), requestId);
-  if (pathname === '/api/imports/latest' && req.method === 'GET') return sendJson(res, 200, await cachedJson('bonus:cache:imports:latest:v1', 60, latestImports), requestId);
-  if (pathname === '/api/imports/period-summary' && req.method === 'GET') { const period = url.searchParams.get('period') || ''; return sendJson(res, 200, await cachedJson('bonus:cache:imports:period:' + period, 60, () => importPeriodSummary(period)), requestId); }
-  if (pathname === '/api/imports/remove-period' && req.method === 'POST') { await checkMutation(req, res); const body = await readJson(req, 1024), result = await removeImportPeriod(safeText(body.period, 'period', 7, true), req); await invalidateCache('bonus:cache:imports:status:v1', 'bonus:cache:imports:catalog:v1', 'bonus:cache:imports:latest:v1', 'bonus:cache:imports:period:' + body.period); return sendJson(res, 200, result, requestId); }
+  if (pathname === '/api/imports' && req.method === 'POST') { await checkMutation(req, res); const payload = await readJson(req, maxImportPayload), result = await persistImport(payload, req); if (!result.idempotent) { const periodKeys = [...new Set((payload.rows || []).map(importedRowPeriod).filter(Boolean))].map(period => 'bonus:cache:imports:period:' + period); await invalidateCache('bonus:cache:imports:status:v1', 'bonus:cache:imports:catalog:v1', 'bonus:cache:imports:latest:v1', ...periodKeys); await invalidateCachePrefix('bonus:cache:imports:latest:v2:'); } return sendJson(res, 201, result, requestId); }
+  if (pathname === '/api/imports/status' && req.method === 'GET') return sendJson(res, 200, await cachedJson('bonus:cache:imports:status:v1', 300, latestImportStatus, 'imports-status'), requestId, 'imports-status');
+  if (pathname === '/api/imports/catalog' && req.method === 'GET') return sendJson(res, 200, await cachedJson('bonus:cache:imports:catalog:v1', 1800, importCatalog, 'imports-catalog'), requestId, 'imports-catalog');
+  if (pathname === '/api/imports/latest' && req.method === 'GET') { const periods = url.searchParams.getAll('period'); const key = 'bonus:cache:imports:latest:v2:' + [...new Set(periods)].sort().join(','); return sendJson(res, 200, await cachedJson(key, 300, () => latestImports(periods), 'imports-latest'), requestId, 'imports-latest'); }
+  if (pathname === '/api/imports/period-summary' && req.method === 'GET') { const period = url.searchParams.get('period') || ''; return sendJson(res, 200, await cachedJson('bonus:cache:imports:period:' + period, 600, () => importPeriodSummary(period), 'imports-period-summary'), requestId, 'imports-period-summary'); }
+  if (pathname === '/api/imports/remove-period' && req.method === 'POST') { await checkMutation(req, res); const body = await readJson(req, 1024), result = await removeImportPeriod(safeText(body.period, 'period', 7, true), req); await invalidateCache('bonus:cache:imports:status:v1', 'bonus:cache:imports:catalog:v1', 'bonus:cache:imports:latest:v1', 'bonus:cache:imports:period:' + body.period); await invalidateCachePrefix('bonus:cache:imports:latest:v2:'); return sendJson(res, 200, result, requestId); }
   if (pathname === '/api/teams' && req.method === 'GET') { await requireRole(req, ['manager', 'coordinator', 'dispatcher']); return sendJson(res, 200, await cachedJson('bonus:cache:teams:v1', 60, listTeamConfigs), requestId); }
-  if (pathname === '/api/teams' && req.method === 'POST') { await checkMutation(req, res); const result = await saveTeamConfig(await readJson(req, 2 * 1024 * 1024), req); await invalidateCache('bonus:cache:teams:v1'); return sendJson(res, 201, result, requestId); }
+  if (pathname === '/api/teams' && req.method === 'POST') { await checkMutation(req, res, ['manager', 'coordinator']); const result = await saveTeamConfig(await readJson(req, 2 * 1024 * 1024), req); await invalidateCache('bonus:cache:teams:v1'); return sendJson(res, 201, result, requestId); }
   if (pathname === '/api/invoices' && req.method === 'GET') { await checkPrivateRead(req, ['manager', 'coordinator']); return sendJson(res, 200, await cachedJson('bonus:cache:invoices:v1', 60, listInvoices), requestId); }
   if (pathname === '/api/invoices' && req.method === 'POST') { await checkMutation(req, res, ['manager', 'coordinator']); const result = await saveInvoice(await readJson(req, 15 * 1024 * 1024), req); await invalidateCache('bonus:cache:invoices:v1'); return sendJson(res, 201, result, requestId); }
   const invoiceMatch = pathname.match(/^\/api\/invoices\/([a-f0-9-]{36})\/file$/i); if (invoiceMatch && req.method === 'GET') { await checkPrivateRead(req, ['manager', 'coordinator']); return downloadInvoice(invoiceMatch[1], res); }
@@ -360,11 +487,30 @@ async function routeRequest(req, res) {
   if ((pathname === '/' || pathname === '/index.html') && !(await currentSession(req))) { res.statusCode = 302; res.setHeader('Location', '/login.html'); return res.end(); }
   const publicWithoutAuth = new Set(['/login.html', '/login.js', '/alc-logo.png', '/favicon.png']);
   if (!publicWithoutAuth.has(pathname) && !(await currentSession(req))) throw new HttpError(401, 'authentication-required');
-  const data = await readFile(file); res.setHeader('content-type', mime[fileExtension(file)] || 'application/octet-stream'); res.setHeader('cache-control', pathname.endsWith('.json') ? 'no-store' : 'public, max-age=300'); res.end(data);
+  let data;
+  if (pathname.endsWith('.json')) {
+    const rows = await readStaticJson(file);
+    const periods = selectedOperationPeriods(url.searchParams.getAll('period')).map(operationPeriod);
+    if (periods.length && Array.isArray(rows)) {
+      const filtered = rows.filter(row => {
+        let raw = row?.data ?? row?.Data ?? row?.date ?? row?.Date;
+        if (raw === undefined && Number.isFinite(Number(row?.data_serial))) raw = new Date(Date.UTC(1899, 11, 30) + Number(row.data_serial) * 86400000).toISOString().slice(0, 10);
+        return periods.some(period => operationPeriodContains(raw, period));
+      });
+      data = Buffer.from(JSON.stringify(filtered));
+    } else data = Buffer.from(JSON.stringify(rows));
+  } else data = await readFile(file);
+  res.setHeader('content-type', mime[fileExtension(file)] || 'application/octet-stream'); res.setHeader('cache-control', pathname.endsWith('.json') || pathname.endsWith('.html') ? 'no-store' : 'public, max-age=300'); res.end(data);
 }
 
-const server = createServer((req, res) => { securityHeaders(res); req.setTimeout(30000); routeRequest(req, res).catch(error => sendError(res, error, req.requestId || randomUUID())); });
+const performanceEndpoints = new Set(['/api/imports/status', '/api/imports/catalog', '/api/imports/latest', '/api/imports/period-summary', '/api/invoices']);
+const server = createServer((req, res) => {
+  securityHeaders(res); req.setTimeout(30000);
+  const startedAt = performance.now(), pathname = String(req.url || '/').split('?')[0];
+  if (performanceEndpoints.has(pathname)) res.once('finish', () => logPerformance('http-request-performance', {method: req.method, path: pathname, status: res.statusCode, durationMs: Math.round(performance.now() - startedAt), responseBytes: Number(res.getHeader('content-length')) || null, requestId: req.requestId || null}));
+  routeRequest(req, res).catch(error => sendError(res, error, req.requestId || randomUUID()));
+});
 server.headersTimeout = 15000; server.requestTimeout = 60000; server.keepAliveTimeout = 5000;
 async function start() { if (pool) pool.on('error', error => console.error(JSON.stringify({event: 'database-pool-error', message: error.message}))); if (pool && runDbMigrations) { try { await initDatabase(); } catch (error) { console.error(JSON.stringify({event: 'database-initialization-failed', message: error.message})); } } server.listen(port, '0.0.0.0', () => console.log(`Dashboard listening on ${port}${pool ? '' : ' (database unavailable)'}`)); }
-export { allowedBonusCents, bonusCents, decodeBase64, normalizeRow, publicPath, recordKey, safeFileName };
+export { allowedBonusCents, assertInvoiceBonusEligible, bonusCents, decodeBase64, importPeriodDateRanges, importedDateKey, importDateKeyPriority, importPeriod, importedRowDate, importedRowPeriod, isAllowedTeamDispatcherMode, normalizeRow, normalizeTeamDispatcherConfig, publicPath, recordKey, safeFileName, selectedOperationPeriods, sqlImportDateValue, sqlImportRouteDate, teamModeDispatchers, validateImportDates };
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) start();

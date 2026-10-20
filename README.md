@@ -10,6 +10,20 @@ Painel operacional para acompanhamento mensal e quinzenal da bonificação de di
 
 O Spot usa a quantidade real de dias do período selecionado para calcular a média diária.
 
+## Carregamento de dados
+
+As telas requisitam somente a quinzena ou o mês selecionado; o Comparativo requisita ainda
+o período de referência. O servidor filtra os snapshots antes de responder e mantém os
+JSONs estáticos em cache de processo. As importações persistidas usam `route_date` com
+índice por fonte/período, evitando extrair a data de cada JSON em toda consulta.
+
+Antes de publicar a versão com esse índice, execute uma vez `migrations/2026-10-route-date.sql`
+com um usuário de migração autorizado. O script adiciona e preenche `route_date` e cria o
+índice; não apaga nem altera as linhas originais. Depois valide `/api/imports/catalog` e as
+telas antes de remover as permissões DDL do usuário da aplicação. A migração também pode
+ser executada pelo inicializador em ambiente de produção com `DB_RUN_MIGRATIONS=true`, mas
+desative essa opção após a conclusão e a validação.
+
 ## Regra implementada
 
 1. Cada linha representa uma rota em uma data. Portanto, se um motorista roda mais de uma vez no dia, cada rota continua sendo avaliada individualmente.
