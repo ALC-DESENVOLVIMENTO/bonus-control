@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {assertInvoiceBonusEligible, assertMonthlyInvoicePeriod, importDateKeyPriority, importPeriodDateRanges, importedDateKey, importPeriod, importedRowDate, importedRowPeriod, selectedOperationPeriods, sqlImportDateValue, sqlImportRouteDate, validateImportDates} from '../server.mjs';
+import {assertInvoiceBonusEligible, assertMonthlyInvoicePeriod, importDateKeyPriority, importPeriodDateRanges, importedDateKey, importPeriod, importedRowDate, importedRowPeriod, invoiceContentDisposition, selectedOperationPeriods, sqlImportDateValue, sqlImportRouteDate, validateImportDates} from '../server.mjs';
 
 test('period detection accepts spreadsheet date header casing and duplicate columns', () => {
   assert.equal(importedRowPeriod({DATA: '2026-08-14'}), '2026-08');
@@ -60,6 +60,13 @@ test('invoice periods are monthly only', () => {
   assert.equal(assertMonthlyInvoicePeriod('2026-09').key, '2026-09');
   assert.throws(() => assertMonthlyInvoicePeriod('2026-09:1'), error => error.status === 400 && error.code === 'invoice-period-must-be-monthly');
   assert.throws(() => assertMonthlyInvoicePeriod('invalid'), error => error.status === 400 && error.code === 'invoice-fields-invalid');
+});
+
+test('invoice download preserves the original filename and safely encodes it', () => {
+  const disposition = invoiceContentDisposition('NF São José.pdf');
+  assert.match(disposition, /^attachment; filename="NF Sao Jose\.pdf";/);
+  assert.match(disposition, /filename\*=UTF-8''NF%20S%C3%A3o%20Jos%C3%A9\.pdf$/);
+  assert.throws(() => invoiceContentDisposition('NF.pdf\r\nX-Evil: yes'), error => error.status === 400 && error.code === 'file-name-invalid');
 });
 
 test('SQL date extraction handles case, separators, duplicate suffixes and blank primary headers', () => {
