@@ -5,6 +5,7 @@ body { font-size: 14px; }
 .mode-button.active { background: var(--purple); color: #fff; }
 .period-button { border: 0; background: transparent; color: #858692; border-radius: 5px; padding: 8px 10px; font: 700 10px 'DM Mono', monospace; cursor: pointer; white-space: nowrap; }
 .period-button.active { background: var(--purple); color: #fff; }
+.period-button:disabled { cursor: not-allowed; opacity: .48; }
 .period-switch { margin-right: -4px; }
 .spot-thresholds { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
 .spot-threshold { border: 1px solid var(--line); border-radius: 6px; padding: 8px 9px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }

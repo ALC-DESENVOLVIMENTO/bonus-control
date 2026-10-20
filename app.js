@@ -137,7 +137,9 @@ function selectedPeriodDays(month=selectedDataMonth(),part=selectedPeriodPart())
 function selectedFfPlannedDays(month=selectedDataMonth(),part=selectedPeriodPart()){return BonusPeriod.fixedFleetPlannedDays(FF_LOGIC_RULE.plannedDays,part)||selectedPeriodDays(month,part)}
 function periodName(part=selectedPeriodPart()){return part==='monthly'?'Mensal':part==='2'?'2ª Quinzena':'1ª Quinzena'}
 function periodLabel(month=selectedDataMonth(),part=selectedPeriodPart()){const bounds=periodBounds(month,part);return part==='monthly'?`Mensal · ${monthLabel(month)}`:`${periodName(part)} · ${String(bounds.start).padStart(2,'0')} a ${String(bounds.end).padStart(2,'0')} de ${monthLabel(month)}`}
-function selectedInvoicePeriod(month=selectedDataMonth(),part=selectedPeriodPart()){return part==='monthly'?month:`${month}:${part}`}
+let invoiceScreenReturnPeriodPart=null;
+function selectedInvoicePeriod(month=selectedDataMonth()){return month}
+function syncInvoicePeriodLock(){if(state.view==='notas'){if(invoiceScreenReturnPeriodPart===null)invoiceScreenReturnPeriodPart=state.periodPart;state.periodPart='monthly'}else if(invoiceScreenReturnPeriodPart!==null){state.periodPart=invoiceScreenReturnPeriodPart;invoiceScreenReturnPeriodPart=null}}
 function invoicePeriodLabel(value){const [month,part]=String(value||'').split(':');return part?`${part==='2'?'2ª':'1ª'} Quinzena · ${monthLabel(month)}`:`Mensal · ${monthLabel(month)}`}
 function refreshMonthOptions(preferLatest=false){const select=document.querySelector('#monthSelect');if(!select)return;const current=selectedDataMonth(),now=new Date(),currentMonth=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`,isValidMonth=period=>/^\d{4}-(0[1-9]|1[0-2])$/.test(period)&&period<=currentMonth,catalogMonths=Object.values(importCatalogState.sources||{}).flatMap(source=>(source.periods||[]).map(item=>item.period)).filter(isValidMonth),months=new Set([...state.ffRoutes,...state.spotRoutes].map(r=>routeMonth(r.date)).filter(isValidMonth));catalogMonths.forEach(month=>months.add(month));if(!months.size)months.add(`${currentMonth}`);const ordered=[...months].sort().reverse();select.innerHTML=ordered.map(month=>`<option value="${month}">${monthLabel(month)}</option>`).join('');select.value=!preferLatest&&ordered.includes(current)?current:ordered[0]}
 function readLogicRows(rows){return rows.map(raw=>{const r=normalized(raw);return {base:canonicalBase(r.base),placa:String(r.placa||'').trim(),date:logicDate(r.data||r.date),status:String(r.rotas||r.status||'').trim().toUpperCase(),reserva:String(r.reservas||r.reserva||'').trim()}}).filter(r=>r.base&&r.placa&&r.date&&!invalidLogicValue(r.base)&&!invalidLogicValue(r.placa))}
@@ -234,7 +236,7 @@ document.querySelectorAll('.nav-link').forEach(a=>a.addEventListener('click',e=>
 state.dispatcherReference={bases:{}};state.teamConfigs={};state.invoices=[];state.expandedBases=new Set();state.routeRank='all';state.routeBase='';
 function workspaceTeamKey(base){return baseNorm(canonicalBase(base))}
 function workspaceTeam(base){const key=workspaceTeamKey(base),ref=state.dispatcherReference.bases[key]||{},saved=state.teamConfigs[key]||{},configured=Object.prototype.hasOwnProperty.call(state.teamConfigs,key),dispatchers=configured?(saved.dispatchers||[]):(ref.dispatchers||[]),dispatcherModes=configured?(saved.dispatcherModes||Object.fromEntries(dispatchers.map(name=>[name,'both']))):Object.fromEntries(dispatchers.map(name=>[name,'both']));return {base:canonicalBase(base),coordinator:saved.coordinator||ref.coordinator||'',dispatchers,dispatcherModes,ffDispatchers:dispatchers.filter(name=>['ff','both'].includes(dispatcherModes[name])),spotDispatchers:dispatchers.filter(name=>['spot','both'].includes(dispatcherModes[name])),configured,ffRecipient:saved.ffRecipient||''}}
-function workspaceInvoice(base,mode,dispatcher){return state.invoices.find(invoice=>invoice.period===selectedInvoicePeriod()&&invoice.mode===mode&&workspaceTeamKey(invoice.base)===workspaceTeamKey(base)&&invoice.dispatcher===dispatcher)}
+function workspaceInvoice(base,mode,dispatcher){if(selectedPeriodPart()!=='monthly')return null;return state.invoices.find(invoice=>invoice.period===selectedInvoicePeriod()&&invoice.mode===mode&&workspaceTeamKey(invoice.base)===workspaceTeamKey(base)&&invoice.dispatcher===dispatcher)}
 function workspaceSpotBonus(base){const metric=spotMonthlyMetrics().find(item=>workspaceTeamKey(item.base)===workspaceTeamKey(base)),team=workspaceTeam(base),count=team.configured?team.spotDispatchers.length:team.dispatchers.length||spotDispatchers(),payout=BonusSpot.bonusForCars(metric?.cars,count||1);return {metric,band:payout.band,count,per:count?payout.perDispatcher:0,total:payout.total}}
 function workspaceTeamPanel(base,row){
   const team=workspaceTeam(base),mode=state.mode,spot=mode==='spot',ffAmount=spot?0:payoutProxy(row),spotInfo=spot?workspaceSpotBonus(base):null,amount=spot?spotInfo.per:ffAmount,selected=team.ffRecipient||'';
@@ -260,7 +262,21 @@ function basesView(){
   const headers=spot?'<tr><th>#</th><th>BASE</th><th>ROTAS SPOT</th><th>NÃO ELEGÍVEIS</th><th>AMB. EXCLUÍDAS</th><th>DS SPOT</th><th>FAIXA</th><th>BÔNUS SPOT</th><th>STATUS</th><th>+</th></tr>':'<tr><th>#</th><th>BASE</th><th>ROTAS TOTAIS</th><th>ROTAS FF</th><th>NÃO ELEGÍVEIS</th><th>AMB. EXCLUÍDAS</th><th>PART. FF*</th><th>DS FF</th><th>FAIXA</th><th>BÔNUS FF</th><th>STATUS</th><th>+</th></tr>';
   return head+baseToolbar()+`<article class="card"><div class="table-scroll"><table class="data-table base-table"><thead>${headers}</thead><tbody>${body}</tbody></table></div></article>`;
 }
-function invoicesView(){const query=state.query.toLowerCase(),mode=state.mode,rows=state.invoices.filter(invoice=>invoice.period===selectedInvoicePeriod()&&invoice.mode===mode&&`${invoice.base} ${invoice.dispatcher} ${invoice.file_name}`.toLowerCase().includes(query));return `${header('Notas Fiscais',`Documentos anexados para ${mode==='spot'?'Spot':'Frota Fixa'} no período selecionado.`)}<div class="invoice-toolbar"><input class="search-input" id="viewSearch" placeholder="Buscar por Base, dispatcher ou arquivo" value="${esc(state.query)}" /><span>${rows.length.toLocaleString('pt-BR')} documento(s) no período</span></div><article class="card"><div class="table-scroll"><table class="data-table invoice-table"><thead><tr><th>PERÍODO</th><th>MODALIDADE</th><th>BASE</th><th>DISPATCHER</th><th>VALOR</th><th>ARQUIVO</th><th>ENVIADA EM</th><th>ARQUIVO</th></tr></thead><tbody>${rows.length?rows.map(invoice=>`<tr><td>${invoicePeriodLabel(invoice.period)}</td><td>${invoice.mode==='spot'?'Spot':'Frota Fixa'}</td><td><b>${esc(invoice.base)}</b></td><td>${esc(invoice.dispatcher)}</td><td>${moneyExact(invoice.amount||0)}</td><td>${esc(invoice.file_name)}</td><td>${new Date(invoice.created_at).toLocaleString('pt-BR')}</td><td><a class="secondary-button invoice-download" href="/api/invoices/${encodeURIComponent(invoice.file_token||'')}/file" target="_blank" rel="noopener">Baixar</a></td></tr>`).join(''):`<tr><td colspan="8" class="empty-state">Nenhuma nota fiscal anexada para este período e modalidade.</td></tr>`}</tbody></table></div></article>`}
+function filteredInvoices(){const query=state.query.toLowerCase(),mode=state.mode,period=selectedInvoicePeriod();return state.invoices.filter(invoice=>invoice.period===period&&invoice.mode===mode&&`${invoice.base} ${invoice.dispatcher} ${invoice.file_name}`.toLowerCase().includes(query))}
+function downloadInvoicesExcel(){
+  const rows=filteredInvoices();
+  if(!window.XLSX){toast('A exportação Excel está indisponível no momento.');return}
+  const data=[['PERÍODO','MODALIDADE','BASE','DISPATCHER','VALOR','ARQUIVO','ENVIADA EM'],...rows.map(invoice=>[
+    invoicePeriodLabel(invoice.period),invoice.mode==='spot'?'Spot':'Frota Fixa',invoice.base,invoice.dispatcher,Number(invoice.amount||0),invoice.file_name,new Date(invoice.created_at).toLocaleString('pt-BR')
+  ])],sheet=XLSX.utils.aoa_to_sheet(data);
+  sheet['!cols']=[{wch:24},{wch:16},{wch:34},{wch:32},{wch:16},{wch:48},{wch:22}];
+  for(let row=1;row<data.length;row++){const cell=sheet[XLSX.utils.encode_cell({r:row,c:4})];if(cell)cell.z='"R$" #,##0.00'}
+  sheet['!autofilter']={ref:`A1:G${Math.max(1,data.length)}`};
+  const workbook=XLSX.utils.book_new();XLSX.utils.book_append_sheet(workbook,sheet,'Notas Fiscais');
+  XLSX.writeFile(workbook,`notas-fiscais_${state.mode}_${selectedDataMonth()}.xlsx`);
+  toast(`${rows.length.toLocaleString('pt-BR')} registro(s) exportado(s) para Excel.`)
+}
+function invoicesView(){const rows=filteredInvoices(),mode=state.mode;return `${header('Notas Fiscais',`Documentos anexados para ${mode==='spot'?'Spot':'Frota Fixa'} no mês selecionado.`)}<div class="invoice-toolbar"><input class="search-input" id="viewSearch" placeholder="Buscar por Base, dispatcher ou arquivo" value="${esc(state.query)}" /><span>${rows.length.toLocaleString('pt-BR')} documento(s) no mês</span><button class="secondary-button" data-action="downloadInvoices" ${rows.length?'':'disabled'}>↓ Baixar Excel</button></div><article class="card"><div class="table-scroll"><table class="data-table invoice-table"><thead><tr><th>PERÍODO</th><th>MODALIDADE</th><th>BASE</th><th>DISPATCHER</th><th>VALOR</th><th>ARQUIVO</th><th>ENVIADA EM</th><th>ARQUIVO</th></tr></thead><tbody>${rows.length?rows.map(invoice=>`<tr><td>${invoicePeriodLabel(invoice.period)}</td><td>${invoice.mode==='spot'?'Spot':'Frota Fixa'}</td><td><b>${esc(invoice.base)}</b></td><td>${esc(invoice.dispatcher)}</td><td>${moneyExact(invoice.amount||0)}</td><td>${esc(invoice.file_name)}</td><td>${new Date(invoice.created_at).toLocaleString('pt-BR')}</td><td><a class="secondary-button invoice-download" href="/api/invoices/${encodeURIComponent(invoice.file_token||'')}/file" target="_blank" rel="noopener">Baixar</a></td></tr>`).join(''):`<tr><td colspan="8" class="empty-state">Nenhuma nota fiscal anexada para este mês e modalidade.</td></tr>`}</tbody></table></div></article>`}
 async function workspaceSaveTeam(base,ffRecipient){const current=workspaceTeam(base),key=workspaceTeamKey(base),payload={base:current.base,coordinator:current.coordinator,dispatchers:current.dispatchers,dispatcherModes:current.dispatcherModes,ffRecipient:ffRecipient??current.ffRecipient};try{const response=await authFetch('/api/teams',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});if(!response.ok)throw new Error('team-save-'+response.status);const saved=await response.json();state.teamConfigs[key]={coordinator:saved.coordinator||'',dispatchers:saved.dispatchers||[],dispatcherModes:saved.modes||{},ffRecipient:saved.ffRecipient||''};toast('Responsável pelo bônus FF salvo.');render()}catch(error){if(error?.message==='authentication-required')return;console.warn('Equipe não salva no banco',error);toast('Não foi possível salvar a equipe.')} }
 async function workspaceSaveTeamEditor(base,panel){if(!roleCan('canManageTeams')){accessDenied();return}const editor=panel?.querySelector('.team-manager-editor');if(!editor)return;const dispatchers=[],dispatcherModes={},unassigned=[];editor.querySelectorAll('.team-edit-dispatcher').forEach(row=>{const name=row.querySelector('[data-team-dispatcher-name]')?.value.trim(),mode=row.querySelector('[data-team-dispatcher-mode]')?.value;if(name){dispatchers.push(name);dispatcherModes[name]=mode;if(!['ff','spot'].includes(mode))unassigned.push(name)}});if(unassigned.length){toast('Selecione SPOT ou Frota Fixa para cada dispatcher antes de salvar.');return}let recipient=editor.querySelector('[data-team-ff-recipient]')?.value||'';if(recipient&&dispatcherModes[recipient]!=='ff')recipient='';if(!recipient){const ffNames=dispatchers.filter(name=>dispatcherModes[name]==='ff');if(ffNames.length===1)recipient=ffNames[0]}const current=workspaceTeam(base),payload={base:current.base,coordinator:current.coordinator,dispatchers,dispatcherModes,ffRecipient:recipient};try{const response=await authFetch('/api/teams',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});if(!response.ok)throw new Error('team-save-'+response.status);const saved=await response.json();state.teamConfigs[workspaceTeamKey(base)]={coordinator:saved.coordinator||'',dispatchers:saved.dispatchers||[],dispatcherModes:saved.modes||{},ffRecipient:saved.ffRecipient||''};toast('Equipe e responsabilidades atualizadas. Os bônus foram recalculados.');render()}catch(error){if(error?.message==='authentication-required')return;console.warn('Equipe não salva no banco',error);toast(error.message==='team-save-403'?'Acesso negado para editar dispatchers.':'Não foi possível salvar as alterações da equipe.')}}
 async function workspaceInvoiceUpload(input){
@@ -338,7 +354,7 @@ comparisonView=()=>{const content=comparisonViewBase().replace('Maior volume atu
 document.addEventListener('change',event=>{const target=interactionElement(event.target);if(target?.id==='comparisonStatusSelect'){state.comparisonStatus=target.value;scheduleInteractionRender()} });
 
 // Período operacional: todos os painéis usam a mesma quinzena selecionada.
-function setPeriodPart(part){const next=part==='monthly'?'monthly':part==='2'?'2':'1';if(next===selectedPeriodPart())return;state.periodPart=next;localStorage.setItem('periodPart',next);if(next!=='monthly'&&state.baseSort==='bonus')state.baseSort='ranking';if(next!=='monthly'&&state.comparisonSort==='bonus')state.comparisonSort='evolution';state.query='';state.routePage=1;state.expandedDrivers?.clear();state.expandedBases?.clear();queuePeriodChange()}
+function setPeriodPart(part){const next=part==='monthly'?'monthly':part==='2'?'2':'1';if(state.view==='notas'&&next!=='monthly')return;if(next===selectedPeriodPart())return;state.periodPart=next;localStorage.setItem('periodPart',next);if(next!=='monthly'&&state.baseSort==='bonus')state.baseSort='ranking';if(next!=='monthly'&&state.comparisonSort==='bonus')state.comparisonSort='evolution';state.query='';state.routePage=1;state.expandedDrivers?.clear();state.expandedBases?.clear();queuePeriodChange()}
 document.addEventListener('click',event=>{const target=interactionElement(event.target),button=target?.closest('.period-button');if(!button)return;event.preventDefault();event.stopImmediatePropagation();setPeriodPart(button.dataset.periodPart)},true);
 
 const comparisonDataForMonthBeforePeriod=comparisonDataForMonth;
@@ -435,6 +451,12 @@ workspaceTeamPanel=(base,row)=>{
     const team=workspaceTeam(base),ffRecipient=team.ffRecipient||(team.ffDispatchers.length===1?team.ffDispatchers[0]:''),rows=team.dispatchers.map(name=>`<div class="team-edit-dispatcher"><input class="search-input" aria-label="Nome do dispatcher" data-team-dispatcher-name value="${esc(name)}" maxlength="160"><select class="filter-select" aria-label="Modalidade responsável" data-team-dispatcher-mode><option value="" disabled ${!['ff','spot'].includes(team.dispatcherModes[name])?'selected':''}>Selecione a modalidade</option><option value="ff" ${team.dispatcherModes[name]==='ff'?'selected':''}>Frota Fixa</option><option value="spot" ${team.dispatcherModes[name]==='spot'?'selected':''}>SPOT</option></select><button type="button" class="secondary-button" data-action="removeTeamDispatcher" aria-label="Remover dispatcher">Remover</button></div>`).join(''),editor=`<section class="team-manager-editor" data-team-base="${esc(base)}"><div class="team-edit-heading"><strong>Gerenciar dispatchers e modalidade</strong><small>Defina em qual cálculo cada pessoa participa. A mudança recalcula a divisão dos bônus atingidos.</small></div><div class="team-dispatcher-list">${rows}</div><div class="team-edit-add"><input class="search-input" aria-label="Novo dispatcher" data-team-new-dispatcher placeholder="Nome do novo dispatcher" maxlength="160"><button type="button" class="secondary-button" data-action="addTeamDispatcher">Adicionar</button></div><label class="team-edit-recipient">Responsável pelo bônus integral de Frota Fixa<select class="filter-select" data-team-ff-recipient><option value="">Nenhum dispatcher selecionado</option>${team.ffDispatchers.map(name=>`<option value="${esc(name)}" ${ffRecipient===name?'selected':''}>${esc(name)}</option>`).join('')}</select></label><button type="button" class="primary-button" data-action="saveTeamConfig" data-base="${esc(base)}">Salvar equipe</button></section>`;
     html=html.replace('</div></td></tr>',`${editor}</div></td></tr>`);
   }
+  return html;
+};
+const workspaceTeamPanelMonthlyInvoices=workspaceTeamPanel;
+workspaceTeamPanel=(base,row)=>{
+  let html=workspaceTeamPanelMonthlyInvoices(base,row);
+  if(selectedPeriodPart()!=='monthly')html=html.replace(/<label class="invoice-upload">[\s\S]*?<\/label>/g,'<small class="invoice-unavailable">Anexos de NF disponíveis somente na bonificação mensal.</small>');
   return html;
 };
 
@@ -619,6 +641,8 @@ async function loadOptimized(){
 }
 load=loadOptimized;
 for(const handlerName of ['handleDdsImport','handleMercadoImport','handleLogicImport','handleFleetReferenceImport']){const previousHandler=window[handlerName]||globalThis[handlerName];if(typeof previousHandler!=='function')continue;globalThis[handlerName]=async event=>{const previousPeriod=operationPeriodToken();await previousHandler(event);if(operationPeriodToken()!==previousPeriod)queuePeriodChange()}}
+const handleDelegatedActionBeforeInvoiceExport=handleDelegatedAction;
+handleDelegatedAction=button=>{if(button.dataset.action==='downloadInvoices'){downloadInvoicesExcel();return}handleDelegatedActionBeforeInvoiceExport(button)};
 
 async function bootstrap(){
   try{
@@ -627,13 +651,23 @@ async function bootstrap(){
     const requested=location.hash.slice(1);
     if(requested&&!roleCanView(requested))accessDenied();
     state.view=roleCanView(requested)?requested:'dashboard';
+    syncInvoicePeriodLock();
     await Promise.all([load(),hydrateWorkspaceDetails()]);
   }catch(error){if(error?.message!=='authentication-required'){console.error(error);app.innerHTML='<div class="card empty-state">Não foi possível iniciar o painel.</div>'}}
   finally{const overlay=document.querySelector('#initialLoadOverlay');overlay?.classList.add('is-hidden');overlay?.setAttribute('aria-hidden','true')}
 }
 const renderWithSelectedPeriodStatus = render;
 render = () => {
+  syncInvoicePeriodLock();
   renderWithSelectedPeriodStatus();
+  const invoiceView=state.view==='notas';
+  document.querySelectorAll('.period-button').forEach(button=>{
+    const locked=invoiceView&&button.dataset.periodPart!=='monthly';
+    button.disabled=locked;
+    if(locked){button.setAttribute('aria-disabled','true');button.title='Notas Fiscais disponíveis somente no período mensal.'}
+    else{button.removeAttribute('aria-disabled');button.removeAttribute('title')}
+    button.classList.toggle('active',button.dataset.periodPart===selectedPeriodPart());
+  });
   const status = document.querySelector('.sidebar-foot');
   if (status) status.innerHTML = `<span class="status-dot"></span> Dados de ${esc(monthLabel(selectedDataMonth()).toLowerCase())} carregados<br /><small>Período: ${esc(periodName())} · fonte: importações salvas</small>`;
 };

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {assertInvoiceBonusEligible, importDateKeyPriority, importPeriodDateRanges, importedDateKey, importPeriod, importedRowDate, importedRowPeriod, selectedOperationPeriods, sqlImportDateValue, sqlImportRouteDate, validateImportDates} from '../server.mjs';
+import {assertInvoiceBonusEligible, assertMonthlyInvoicePeriod, importDateKeyPriority, importPeriodDateRanges, importedDateKey, importPeriod, importedRowDate, importedRowPeriod, selectedOperationPeriods, sqlImportDateValue, sqlImportRouteDate, validateImportDates} from '../server.mjs';
 
 test('period detection accepts spreadsheet date header casing and duplicate columns', () => {
   assert.equal(importedRowPeriod({DATA: '2026-08-14'}), '2026-08');
@@ -54,6 +54,12 @@ test('invoice eligibility fails closed if bonus cannot be confirmed and rejects 
   assert.equal(assertInvoiceBonusEligible(130000), 130000);
   assert.throws(() => assertInvoiceBonusEligible(0), error => error.status === 409 && error.code === 'invoice-base-not-bonus-eligible');
   assert.throws(() => assertInvoiceBonusEligible(null), error => error.status === 503 && error.code === 'bonus-eligibility-unavailable');
+});
+
+test('invoice periods are monthly only', () => {
+  assert.equal(assertMonthlyInvoicePeriod('2026-09').key, '2026-09');
+  assert.throws(() => assertMonthlyInvoicePeriod('2026-09:1'), error => error.status === 400 && error.code === 'invoice-period-must-be-monthly');
+  assert.throws(() => assertMonthlyInvoicePeriod('invalid'), error => error.status === 400 && error.code === 'invoice-fields-invalid');
 });
 
 test('SQL date extraction handles case, separators, duplicate suffixes and blank primary headers', () => {
